@@ -271,9 +271,12 @@ function draw() {
       if (p[0] < 0 || p[1] < 60 * DPR || p[0] > w || p[1] > h - 150 * DPR) continue;
       const key = Math.round(p[0] / cell) + ',' + Math.round(p[1] / cell);
       if (taken.has(key)) continue;
-      taken.add(key);
       const size = (rank <= 1 ? 16 : rank <= 2 ? 14 : rank <= 3 ? 12.5 : 11) * DPR;
       ctx.font = `${rank <= 2 ? '600 ' : ''}${size}px -apple-system,system-ui,sans-serif`;
+      // обрізаний підпис гірший за його відсутність — пропускаємо, якщо не влазить
+      const half = ctx.measureText(pl.n).width / 2;
+      if (p[0] - half < 6 * DPR || p[0] + half > w - 6 * DPR) continue;
+      taken.add(key);
       ctx.strokeStyle = 'rgba(11,15,20,.85)'; ctx.lineWidth = 3 * DPR;
       ctx.strokeText(pl.n, p[0], p[1]);
       ctx.fillStyle = rank <= 2 ? '#e8eef5' : '#b9c6d4';
