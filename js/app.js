@@ -23,7 +23,7 @@ const S = {
   sensorsOn: false, gpsWatch: null, lastDraw: 0, recording: false,
   traffic: null, showTraffic: true, track: null,
   bld: null, bldLoading: false, places: [], voice: null, lastSpoken: null,
-  netTimer: null, netPending: false, lastNetAt: 0, lastFixAt: 0,
+  netTimer: null, netPending: false, lastNetAt: 0, lastFixAt: 0, lastGeoErr: '',
 };
 
 // ---------- завантаження даних ----------
@@ -471,19 +471,52 @@ function startGps() {
   if (!('geolocation' in navigator)) { $('txtGps').textContent = 'Геолокація недоступна'; return; }
   // 1) Спершу просимо грубу позицію: її iOS бере з веж зв'язку та Wi-Fi, без супутників.
   //    Вона приходить за секунду-дві й працює там, де РЕБ глушить GPS.
-  locateByNetwork(true);
+  findMe(true);
   // 2) Паралельно — звичайне стеження з максимальною точністю (супутники, коли є).
   S.gpsWatch = navigator.geolocation.watchPosition((pos) => {
     const c = pos.coords;
     S.lastFixAt = Date.now();
     S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed });
   }, (err) => {
+    S.lastGeoErr = geoErrText(err);
     if (err.code === 1) { $('txtGps').textContent = 'Геолокація заборонена'; $('dotGps').className = 'dot bad'; }
   }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
   // 3) Кожні 25 с перепитуємо грубу позицію — це незалежне джерело, яким можна
   //    і підстрахувати дрейф, і впіймати підміну координат.
   clearInterval(S.netTimer);
   S.netTimer = setInterval(() => locateByNetwork(false), 25000);
+}
+
+// Чому не вийшло — зрозумілим текстом, а не кодом помилки
+function geoErrText(err) {
+  if (err.code === 1) return 'Геолокацію заборонено. Параметри → Приватність і безпека → Служби геолокації → увімкнути, знайти Safari (або «Наві») → «При використанні» і «Точне місце».';
+  if (err.code === 2) return 'Система не змогла визначити місце: поруч немає ні супутників, ні знайомих їй мереж. Спробуйте ще раз або вкажіть себе кнопкою «Я тут».';
+  return 'Місце не визначилось вчасно. Натисніть «Де я» ще раз.';
+}
+
+// Явний пошук себе: питаємо і грубу позицію (вежі, Wi-Fi), і точну (супутники).
+// Що прийде першим, те й показуємо; точна потім уточнить тихо.
+function findMe(announce = true) {
+  if (!('geolocation' in navigator)) { toast('Геолокація недоступна в цьому браузері'); return; }
+  if (!S.engine) { toast('Карта ще завантажується'); return; }
+  if (announce) toast('Шукаю вас…');
+  let answered = false;
+  const ok = (pos) => {
+    const c = pos.coords;
+    S.lastNetAt = Date.now(); S.lastGeoErr = '';
+    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed });
+    S.follow = true;
+    if (announce && !answered) {
+      answered = true;
+      const a = Math.round(c.accuracy);
+      const r = a < 1000 ? a + ' м' : (a / 1000).toFixed(1) + ' км';
+      toast(a <= 40 ? `Знайшов по супутниках, ±${r}` : `Знайшов по мережі зв'язку, ±${r} — уточню під час руху`);
+    }
+    draw();
+  };
+  const fail = (err) => { S.lastGeoErr = geoErrText(err); if (announce && !answered) { answered = true; toast(S.lastGeoErr); } };
+  navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy: false, maximumAge: 30000, timeout: 15000 });
+  navigator.geolocation.getCurrentPosition(ok, () => { }, { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 });
 }
 
 // Груба позиція «по мережі»: enableHighAccuracy:false просить систему не вмикати
@@ -601,9 +634,8 @@ $('btnRotate').addEventListener('click', () => { S.view.rotate = !S.view.rotate;
 $('btnSearch').addEventListener('click', openSearch);
 $('btnCenter').addEventListener('click', () => {
   const st = S.engine?.state;
-  if (!st?.xy) { toast('Позицію ще не визначено'); return; }
-  S.follow = true; S.view.scale = Math.max(S.view.scale, 1.2);
-  S.view.cx = st.xy[0]; S.view.cy = st.xy[1]; draw();
+  if (st?.xy) { S.follow = true; S.view.scale = Math.max(S.view.scale, 1.2); S.view.cx = st.xy[0]; S.view.cy = st.xy[1]; draw(); }
+  findMe(true);   // навіть якщо точка вже є — просимо свіжу
 });
 $('addrInput').addEventListener('input', renderSearch);
 document.querySelector('#sheetSearch .tabs').addEventListener('click', (e) => {
@@ -633,10 +665,7 @@ $('addrList').addEventListener('click', (e) => {
   routeTo(S.target);
 });
 
-$('btnLocateNet').addEventListener('click', () => {
-  if (!('geolocation' in navigator)) { toast('Геолокація недоступна в цьому браузері'); return; }
-  toast("Питаю позицію по мережі зв'язку…"); closeSheets(); locateByNetwork(true);
-});
+$('btnLocateNet').addEventListener('click', () => { closeSheets(); findMe(true); });
 $('btnVoice').addEventListener('click', () => { S.voice.setEnabled(!S.voice.enabled); S.voice.warmup(); toast(S.voice.enabled ? (S.voice.hasUk ? 'Голос увімкнено' : 'Голос увімкнено, але українського голосу в системі немає — буде англійський') : 'Голос вимкнено'); $('voiceState').textContent = S.voice.enabled ? 'увімкнено' : 'вимкнено'; });
 function updateTrafficInfo() {
   const st = S.traffic.stats();
@@ -697,7 +726,14 @@ function updateStatus() {
     $('conf').textContent = `${word} ±${r}`;
   }
   if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; }
-  $('btnCenter').classList.toggle('show', !S.follow && !!st.xy);
+  $('btnCenter').classList.add('show');
+  // Діагностика в «⋯»: що саме відповіла система останнього разу
+  const gi = $('geoInfo');
+  if (gi) {
+    if (S.lastGeoErr) gi.textContent = S.lastGeoErr;
+    else if (S.lastNetAt) gi.textContent = `останній відгук ${Math.round((Date.now() - S.lastNetAt) / 1000)} с тому` + (st.net ? `, ±${Math.round(st.net.acc)} м` : '');
+    else gi.textContent = S.sensorsOn ? 'запит надіслано, відповіді ще немає' : 'натисніть «Старт» або «Де я»';
+  }
   updateWhere();
   updateTurn();
 }

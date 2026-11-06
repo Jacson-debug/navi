@@ -44,6 +44,7 @@
   .close { position:absolute; right:10px; top:8px; background:transparent; border:0; font-size:22px; padding:6px 10px; flex:none; }
   .fab { position:fixed; right:12px; bottom:calc(env(safe-area-inset-bottom) + 76px); display:none; background:var(--panel); padding:10px 14px; font-size:14px; border-radius:999px; }
   .fab.show { display:block; }
+  .fab { font-weight:600; }
   .where { font-size:14px; color:var(--fg); }
   .where span { background:var(--panel); border-radius:999px; padding:6px 12px; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .tabs { display:flex; gap:6px; margin:8px 0; }
@@ -94,16 +95,16 @@
   <div class="row"><div class="name">Повороти дзеркальні<small>якщо на карті авто повертає не туди</small></div><button id="btnFlip">Перемкнути</button></div>
   <div class="row"><div class="name">Показувати частинки<small>хмара гіпотез фільтра</small></div><button id="btnParticles">Увімк/вимк</button></div>
   <div class="row"><div class="name">Карта на північ / за курсом</div><button id="btnRotate">Перемкнути</button></div>
-  <div class="row"><div class="name">Визначити по мережі зв'язку<small>вежі та Wi-Fi, працює без супутників</small></div><button id="btnLocateNet">Знайти</button></div>
+  <div class="row"><div class="name">Знайти мене<small id="geoInfo">вежі, Wi-Fi і супутники</small></div><button id="btnLocateNet">Знайти</button></div>
   <div class="row"><div class="name">Голосові підказки<small id="voiceState"></small></div><button id="btnVoice">Увімк/вимк</button></div>
   <div class="row"><div class="name">Шар пробок<small>типова швидкість за вашими поїздками о цій годині</small></div><button id="btnTraffic">Увімк/вимк</button></div>
   <div class="row"><div class="name">Пам'ять пробок<small id="trafficInfo"></small></div><button id="btnTrafficClear">Очистити</button></div>
   <div class="row"><div class="name">Запис датчиків<small>для налагодження алгоритму на комп'ютері</small></div><button id="btnRec">Старт</button></div>
   <div class="row"><div class="name">Дані карти</div><div id="dataInfo" style="color:var(--muted);font-size:13px"></div></div>
-  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.7</div></div>
+  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.7.2</div></div>
 </div>
 
-<button id="btnCenter" class="fab">⌖ До себе</button>
+<button id="btnCenter" class="fab">⌖ Де я</button>
 <div class="toast" id="toast"></div>
 <script type="module" src="js/app.js"></script>
 </body>
