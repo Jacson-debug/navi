@@ -2,7 +2,6 @@
 import { RoadGraph } from './graph.js';
 import { NavEngine } from './engine.js';
 import { route, instructions } from './astar.js';
-import { makeTestCity } from './testcity.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
 import { Buildings, normStreet, shortStreet } from './buildings.js';
@@ -23,7 +22,7 @@ const S = {
   fuelStatus: JSON.parse(localStorage.getItem('navi.fuelStatus') || '{}'),
   sensorsOn: false, gpsWatch: null, lastDraw: 0, recording: false,
   traffic: null, showTraffic: true, track: null,
-  bld: null, bldLoading: false, voice: null, lastSpoken: null,
+  bld: null, bldLoading: false, places: [], voice: null, lastSpoken: null,
   netTimer: null, netPending: false, lastNetAt: 0, lastFixAt: 0,
 };
 
@@ -43,15 +42,15 @@ async function loadData() {
     $('dataInfo').textContent = `${graph.meta?.name || 'карта'}: ${graph.nNodes} вузлів, ${graph.n} доріг, ${fuel.length} АЗС`;
     hint('');
     S.bldLoading = true;
+    fetch('data/places.json').then(async r => { if (r.ok) { S.places = await r.json(); draw(); } }).catch(() => { });
     fetch('data/buildings.bin').then(async r => { if (!r.ok) return; S.bld = Buildings.fromBinary(await r.arrayBuffer()); $('dataInfo').textContent += `, ${S.bld.count} будинків, ${S.bld.entranceCount} під'їздів`; S.bldLoading = false; draw(); }).catch(() => { S.bldLoading = false; });
     return { graph, fuel, real: true };
   } catch (e) {
-    const city = makeTestCity(7);
-    const graph = RoadGraph.fromJSON(city);
-    $('dataInfo').textContent = `Тестове місто (справжньої карти ще немає): ${graph.nNodes} вузлів, ${graph.n} вулиць, ${city.fuel.length} АЗС`;
-    toast('Реальна карта не знайдена — працюємо на тестовому місті');
-    hint('');
-    return { graph, fuel: city.fuel, real: false };
+    // Краще чесно сказати, що карти немає, ніж підсунути вигадане місто
+    $('dataInfo').textContent = 'Карта не завантажилась: ' + e.message;
+    hint('Карта не завантажилась. Відкрийте застосунок з інтернетом хоча б раз, щоб він її зберіг.');
+    toast('Немає даних карти');
+    throw e;
   }
 }
 
@@ -106,6 +105,11 @@ function draw() {
   const lw = Math.max(1, Math.min(10, 6 * v.scale)) * DPR;
   // дороги: спершу дрібні тонкі, потім магістралі товщі
   const widthFor = (lvl) => lvl >= 5 ? lw * 1.6 : lvl >= 4 ? lw * 1.3 : lvl >= 3 ? lw * 1.1 : lvl >= 2 ? lw : lw * 0.6;
+  if (ids === g.major) {
+    ctx.strokeStyle = '#6f8299'; ctx.lineWidth = Math.max(1, lw); ctx.beginPath();
+    for (let i = 0; i < ids.length; i++) drawEdge(ids[i]);
+    ctx.stroke();
+  } else
   for (let lvl = minLevel; lvl <= 5; lvl++) {
     ctx.strokeStyle = '#2a3542'; ctx.lineWidth = widthFor(lvl) + 2 * DPR; ctx.beginPath();
     for (let i = 0; i < ids.length; i++) if (g.level(ids[i]) === lvl) drawEdge(ids[i]);
@@ -140,15 +144,20 @@ function draw() {
       }
     }
   }
-  // Дрібні вулиці ховаються при віддаленні, але дорога під вами має бути видна завжди:
-  // домальовуємо все навколо поточної позиції і підсвічуємо поточне ребро.
+  // Дрібні вулиці ховаються при віддаленні, але дорога під вами має бути видна завжди.
+  // Малюємо навколо позиції круглу «лінзу» з усіма дорогами і підсвічуємо поточне ребро.
   const me = S.engine?.state;
-  if (me && me.xy) {
-    const rr = Math.max(250, 90 / v.scale);
-    const local = g.edgesInBox(me.xy[0] - rr, me.xy[1] - rr, me.xy[0] + rr, me.xy[1] + rr, 1);
+  if (me && me.xy && v.scale >= 0.02) {
+    const rr = Math.min(1500, Math.max(250, 90 / v.scale));
+    const c = worldToScreen(...me.xy);
+    const rpx = rr * v.scale * DPR;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(c[0], c[1], rpx, 0, 7); ctx.clip();
+    const local = g.edgesInBox(me.xy[0] - rr, me.xy[1] - rr, me.xy[0] + rr, me.xy[1] + rr, v.scale < 0.12 ? 2 : 1);
     ctx.strokeStyle = '#55657a'; ctx.lineWidth = Math.max(1.5 * DPR, lw * 0.8); ctx.beginPath();
     for (let i = 0; i < local.length; i++) drawEdge(local[i]);
     ctx.stroke();
+    ctx.restore();
     if (me.edge) {
       ctx.strokeStyle = '#8fa3ba'; ctx.lineWidth = Math.max(2.5 * DPR, lw * 1.1); ctx.beginPath();
       drawEdge(me.edge.id); ctx.stroke();
@@ -246,6 +255,32 @@ function draw() {
   if (S.hereMode) {
     ctx.strokeStyle = '#ffb020'; ctx.lineWidth = 2 * DPR; ctx.beginPath(); ctx.moveTo(w / 2 - 14 * DPR, h / 2); ctx.lineTo(w / 2 + 14 * DPR, h / 2); ctx.moveTo(w / 2, h / 2 - 14 * DPR); ctx.lineTo(w / 2, h / 2 + 14 * DPR); ctx.stroke();
   }
+  // Назви міст, сіл і районів. Що дрібніший масштаб, то лише найбільші;
+  // щоб підписи не злипались, зайняті місця позначаємо в грубій сітці.
+  if (S.places.length && v.scale < 0.6) {
+    const RANK = { city: 1, borough: 2, town: 2, suburb: 3, village: 4, quarter: 5, neighbourhood: 5, hamlet: 5, isolated_dwelling: 6 };
+    const maxRank = v.scale < 0.004 ? 2 : v.scale < 0.012 ? 3 : v.scale < 0.05 ? 4 : 6;
+    const taken = new Set();
+    const cell = 64 * DPR;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.lineJoin = 'round'; ctx.miterLimit = 2;
+    for (const pl of S.places) {
+      const rank = RANK[pl.k] || 6;
+      if (rank > maxRank) continue;
+      const p = worldToScreen(pl.x, pl.y);
+      if (p[0] < 0 || p[1] < 60 * DPR || p[0] > w || p[1] > h - 150 * DPR) continue;
+      const key = Math.round(p[0] / cell) + ',' + Math.round(p[1] / cell);
+      if (taken.has(key)) continue;
+      taken.add(key);
+      const size = (rank <= 1 ? 16 : rank <= 2 ? 14 : rank <= 3 ? 12.5 : 11) * DPR;
+      ctx.font = `${rank <= 2 ? '600 ' : ''}${size}px -apple-system,system-ui,sans-serif`;
+      ctx.strokeStyle = 'rgba(11,15,20,.85)'; ctx.lineWidth = 3 * DPR;
+      ctx.strokeText(pl.n, p[0], p[1]);
+      ctx.fillStyle = rank <= 2 ? '#e8eef5' : '#b9c6d4';
+      ctx.fillText(pl.n, p[0], p[1]);
+    }
+    ctx.textBaseline = 'alphabetic';
+  }
   // масштабна лінійка
   const meters = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000].find(m => m * v.scale * DPR > 60 * DPR) || 5000;
   const px = meters * v.scale * DPR;
@@ -254,6 +289,8 @@ function draw() {
 }
 
 // ---------- жести ----------
+// Нижня межа масштабу — щоб уся область влізла в екран (понад 250 км)
+const clampScale = (v) => Math.max(0.0012, Math.min(14, v));
 let gesture = null;
 canvas.addEventListener('pointerdown', (e) => { canvas.setPointerCapture(e.pointerId); gesture = gesture || { pts: new Map(), moved: false }; gesture.pts.set(e.pointerId, [e.clientX, e.clientY]); gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; });
 canvas.addEventListener('pointermove', (e) => {
@@ -267,7 +304,7 @@ canvas.addEventListener('pointermove', (e) => {
   } else if (pts.length >= 2 && gesture.start.length >= 2) {
     const d0 = Math.hypot(gesture.start[0][0] - gesture.start[1][0], gesture.start[0][1] - gesture.start[1][1]);
     const d1 = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]);
-    S.view.scale = Math.max(0.02, Math.min(12, gesture.startView.scale * d1 / Math.max(1, d0))); gesture.moved = true;
+    S.view.scale = clampScale(gesture.startView.scale * d1 / Math.max(1, d0)); gesture.moved = true;
   }
   draw();
 });
@@ -277,7 +314,7 @@ const endGesture = (e) => {
   gesture.pts.delete(e.pointerId); if (!gesture.pts.size) gesture = null; else { gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; gesture.moved = true; }
 };
 canvas.addEventListener('pointerup', endGesture); canvas.addEventListener('pointercancel', endGesture);
-canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.view.scale = Math.max(0.02, Math.min(12, S.view.scale * (e.deltaY < 0 ? 1.15 : 0.87))); draw(); }, { passive: false });
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.view.scale = clampScale(S.view.scale * (e.deltaY < 0 ? 1.15 : 0.87)); draw(); }, { passive: false });
 
 function onTap(sx, sy) {
   const p = screenToWorld(sx, sy);
@@ -554,6 +591,10 @@ function renderSearch() {
   $('addrList').innerHTML = html;
 }
 
+$('btnMore').addEventListener('click', () => $('sheetMore').classList.add('show'));
+$('btnFlip').addEventListener('click', () => { S.engine.flipTurns(); toast('Знак поворотів перемкнено'); });
+$('btnParticles').addEventListener('click', () => { S.showParticles = !S.showParticles; toast(S.showParticles ? 'Гіпотези показано' : 'Гіпотези сховано'); draw(); });
+$('btnRotate').addEventListener('click', () => { S.view.rotate = !S.view.rotate; toast(S.view.rotate ? 'Карта за курсом' : 'Карта на північ'); draw(); });
 $('btnSearch').addEventListener('click', openSearch);
 $('btnCenter').addEventListener('click', () => {
   const st = S.engine?.state;

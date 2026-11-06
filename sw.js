@@ -4,11 +4,10 @@
 //    без ручного скидання кешу;
 //  - дані (data/*): лише з кешу після першого завантаження — це десятки мегабайт,
 //    їх не можна перекачувати щоразу через мобільний інтернет.
-const VERSION = 'navi-v0.6.0';
+const VERSION = 'navi-v0.7.0';
 const SHELL = ['./', './index.html', './manifest.webmanifest',
   './js/app.js', './js/engine.js', './js/motion.js', './js/filter.js', './js/graph.js',
   './js/astar.js', './js/geo.js', './js/traffic.js', './js/buildings.js', './js/voice.js',
-  './js/testcity.js', './js/simulator.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {

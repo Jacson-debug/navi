@@ -42,6 +42,7 @@ class Collector(osmium.SimpleHandler):
         self.coords = {}        # node id -> (x, y)
         self.use = {}           # node id -> кількість використань
         self.fuel = []
+        self.places = []        # (x, y, name, kind, population) — міста, села, райони
         self.buildings = []     # (x, y, street, housenumber, outline[(x,y)...])
         self.entrances = []     # (x, y, ref, building_hint)
         self.n_ways = 0
@@ -62,6 +63,7 @@ class Collector(osmium.SimpleHandler):
             return
         if t.get('amenity') == 'fuel':
             self.fuel.append(self.fuel_rec('n%d' % n.id, t, n.location.lat, n.location.lon))
+        self._maybe_place(t, n.location.lat, n.location.lon)
         ent = t.get('entrance')
         if ent and ent not in ('no', 'emergency', 'service', 'garage'):
             x, y = self.xy(n.location.lat, n.location.lon)
@@ -71,6 +73,22 @@ class Collector(osmium.SimpleHandler):
             # адресна точка без контуру (часто в селах)
             x, y = self.xy(n.location.lat, n.location.lon)
             self.buildings.append((round(x, 1), round(y, 1), t.get('addr:street'), t.get('addr:housenumber'), []))
+
+    # Назви населених пунктів і районів — щоб на дрібному масштабі було видно, де ти
+    PLACES = {'city': 1, 'borough': 2, 'town': 2, 'suburb': 3, 'village': 4, 'quarter': 5,
+              'neighbourhood': 5, 'hamlet': 5, 'isolated_dwelling': 6}
+
+    def _maybe_place(self, tags, lat, lon):
+        kind = tags.get('place')
+        name = tags.get('name:uk') or tags.get('name')
+        if kind not in self.PLACES or not name:
+            return
+        x, y = self.xy(lat, lon)
+        try:
+            pop = int(''.join(c for c in (tags.get('population') or '0') if c.isdigit()) or 0)
+        except ValueError:
+            pop = 0
+        self.places.append((round(x, 1), round(y, 1), name, kind, pop))
 
     def fuel_rec(self, fid, tags, lat, lon):
         x, y = self.xy(lat, lon)
@@ -96,6 +114,10 @@ class Collector(osmium.SimpleHandler):
                 if self.inside(lat, lon):
                     self.fuel.append(self.fuel_rec('w%d' % w.id, tags, lat, lon))
             return
+        if tags.get('place') and tags.get('name'):
+            pts = [(n.lat, n.lon) for n in w.nodes if n.location.valid()]
+            if pts:
+                self._maybe_place(tags, sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
         if tags.get('building') is not None or tags.get('addr:housenumber'):
             pts = [self.xy(n.lat, n.lon) for n in w.nodes if n.location.valid() and self.inside(n.lat, n.lon)]
             if len(pts) >= 3 or (pts and tags.get('addr:housenumber')):
@@ -249,6 +271,16 @@ def main():
             json.dump(graph, f, ensure_ascii=False, separators=(',', ':'))
     with open(os.path.join(a.out, 'fuel.json'), 'w', encoding='utf-8') as f:
         json.dump(fuel, f, ensure_ascii=False, separators=(',', ':'))
+    # населені пункти й райони: прибираємо дублікати (точка + полігон однієї назви)
+    places, pseen = [], []
+    for x, y, name, kind, pop in sorted(h.places, key=lambda p: (Collector.PLACES[p[3]], -p[4])):
+        if any(nm == name and math.hypot(x - px, y - py) < 4000 for px, py, nm in pseen):
+            continue
+        pseen.append((x, y, name))
+        places.append({'x': x, 'y': y, 'n': name, 'k': kind, 'p': pop})
+    with open(os.path.join(a.out, 'places.json'), 'w', encoding='utf-8') as f:
+        json.dump(places, f, ensure_ascii=False, separators=(',', ':'))
+    print(f'Населених пунктів і районів: {len(places)} → {a.out}/places.json')
     print(f'Готово: {len(nodes)} вузлів, {len(edges)} ребер, {len(fuel)} АЗС → {a.out}/graph.bin '
           f'({os.path.getsize(os.path.join(a.out, "graph.bin")) / 1e6:.1f} МБ), {a.out}/fuel.json')
 
