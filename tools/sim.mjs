@@ -8,7 +8,7 @@ import { dist, mulberry32 } from '../js/geo.js';
 const N = parseInt(process.argv[2] || '12', 10);
 const city = makeTestCity(7);
 const graph = RoadGraph.fromJSON(city);
-const rng = mulberry32(99);
+let rng = mulberry32(99);
 
 function pct(arr, p) { const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(p * a.length))]; }
 
@@ -33,6 +33,12 @@ function runTrip(k, scenario) {
       lastGps = smp.t;
       const [lat, lon] = proj.toLL(tr.x + 6 * (rng() - 0.5) * 2, tr.y + 6 * (rng() - 0.5) * 2);
       eng.pushGps({ t: smp.t, lat, lon, accuracy: 8, speed: tr.v });
+    } else if (scenario.netOnly && smp.t - lastGps >= 25) {
+      // РЕБ глушить супутники, але вежі зв'язку працюють: груба позиція раз на 25 с
+      lastGps = smp.t;
+      const acc = scenario.netAcc ?? 800;
+      const [lat, lon] = proj.toLL(tr.x + (rng() - 0.5) * 2 * acc * 0.7, tr.y + (rng() - 0.5) * 2 * acc * 0.7);
+      eng.pushGps({ t: smp.t, lat, lon, accuracy: acc, speed: null });
     } else if (scenario.spoof && smp.t - lastGps >= 1) {
       lastGps = smp.t; // підміна: координати стрибають на 1–3 км
       const [lat, lon] = proj.toLL(tr.x + 1000 + rng() * 2000, tr.y - 1500 + rng() * 3000);
@@ -50,12 +56,15 @@ function runTrip(k, scenario) {
 }
 
 const scenarios = [
+  { name: 'РЕБ у місті: мережа ±150 м (Wi-Fi поруч), старту з GPS немає', gpsSeconds: -1, ios: true, netOnly: true, netAcc: 150 },
+  { name: 'РЕБ за містом: мережа ±800 м (лише вежі), старту з GPS немає', gpsSeconds: -1, ios: true, netOnly: true, netAcc: 800 },
   { name: 'GPS 60 с, далі РЕБ (iOS)', gpsSeconds: 60, ios: true },
   { name: 'GPS 60 с, далі ПІДМІНА координат (iOS)', gpsSeconds: 60, ios: true, spoof: true },
   { name: 'Без GPS взагалі, ручний старт ±120 м (iOS)', gpsSeconds: -1, ios: true, manualStart: true },
   { name: 'GPS 60 с, далі РЕБ (Android)', gpsSeconds: 60, ios: false },
 ];
 for (const sc of scenarios) {
+  rng = mulberry32(99); // ті самі поїздки в кожному сценарії
   console.log('\n=== ' + sc.name + ' ===');
   console.log('поїздка  довж.м  час.с  безGPS.с  медіана.м  p90.м  макс.м  на_дорозі%  масштаб  вперед');
   const agg = [];

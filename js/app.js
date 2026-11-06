@@ -3,10 +3,9 @@ import { RoadGraph } from './graph.js';
 import { NavEngine } from './engine.js';
 import { route, instructions } from './astar.js';
 import { makeTestCity } from './testcity.js';
-import { simulateDrive } from './simulator.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
-import { Buildings } from './buildings.js';
+import { Buildings, normStreet, shortStreet } from './buildings.js';
 import { Voice, turnPhrase } from './voice.js';
 
 const $ = (id) => document.getElementById(id);
@@ -20,11 +19,12 @@ const S = {
   view: { cx: 0, cy: 0, scale: 1.2 /* px per m */, rotate: false },
   follow: true, showParticles: false,
   routeInfo: null, target: null,
-  demo: null, hereMode: false,
+  hereMode: false, searchTab: 'all',
   fuelStatus: JSON.parse(localStorage.getItem('navi.fuelStatus') || '{}'),
   sensorsOn: false, gpsWatch: null, lastDraw: 0, recording: false,
   traffic: null, showTraffic: true, track: null,
-  bld: null, voice: null, lastSpoken: null,
+  bld: null, bldLoading: false, voice: null, lastSpoken: null,
+  netTimer: null, netPending: false, lastNetAt: 0, lastFixAt: 0,
 };
 
 // ---------- завантаження даних ----------
@@ -42,7 +42,8 @@ async function loadData() {
     const fuel = f.ok ? await f.json() : [];
     $('dataInfo').textContent = `${graph.meta?.name || 'карта'}: ${graph.nNodes} вузлів, ${graph.n} доріг, ${fuel.length} АЗС`;
     hint('');
-    fetch('data/buildings.bin').then(async r => { if (!r.ok) return; S.bld = Buildings.fromBinary(await r.arrayBuffer()); $('dataInfo').textContent += `, ${S.bld.count} будинків, ${S.bld.entranceCount} під'їздів`; draw(); }).catch(() => { });
+    S.bldLoading = true;
+    fetch('data/buildings.bin').then(async r => { if (!r.ok) return; S.bld = Buildings.fromBinary(await r.arrayBuffer()); $('dataInfo').textContent += `, ${S.bld.count} будинків, ${S.bld.entranceCount} під'їздів`; S.bldLoading = false; draw(); }).catch(() => { S.bldLoading = false; });
     return { graph, fuel, real: true };
   } catch (e) {
     const city = makeTestCity(7);
@@ -139,6 +140,20 @@ function draw() {
       }
     }
   }
+  // Дрібні вулиці ховаються при віддаленні, але дорога під вами має бути видна завжди:
+  // домальовуємо все навколо поточної позиції і підсвічуємо поточне ребро.
+  const me = S.engine?.state;
+  if (me && me.xy) {
+    const rr = Math.max(250, 90 / v.scale);
+    const local = g.edgesInBox(me.xy[0] - rr, me.xy[1] - rr, me.xy[0] + rr, me.xy[1] + rr, 1);
+    ctx.strokeStyle = '#55657a'; ctx.lineWidth = Math.max(1.5 * DPR, lw * 0.8); ctx.beginPath();
+    for (let i = 0; i < local.length; i++) drawEdge(local[i]);
+    ctx.stroke();
+    if (me.edge) {
+      ctx.strokeStyle = '#8fa3ba'; ctx.lineWidth = Math.max(2.5 * DPR, lw * 1.1); ctx.beginPath();
+      drawEdge(me.edge.id); ctx.stroke();
+    }
+  }
   // пробки з пам'яті поїздок: колір за типовою швидкістю в цю годину, зі зсувом у бік руху
   if (S.traffic && S.showTraffic && S.traffic.hasData) {
     const slot = TrafficMemory.slot();
@@ -186,17 +201,22 @@ function draw() {
     for (const eid of S.routeInfo.edges) drawEdge(eid);
     ctx.stroke(); ctx.globalAlpha = 1;
   }
-  // АЗС
+  // АЗС: здалеку вони заливають карту, тому показуємо лише при достатньому наближенні
+  // (а також завжди — позначені вами та поточну ціль).
+  const fuelZoom = v.scale >= 0.45;
+  ctx.textAlign = 'center';
   for (const f of S.fuel) {
+    const st = S.fuelStatus[f.id]?.status;
+    const isTarget = S.target && S.target.id === f.id;
+    if (!fuelZoom && !st && !isTarget) continue;
     const p = worldToScreen(f.x, f.y);
     if (p[0] < -40 || p[1] < -40 || p[0] > w + 40 || p[1] > h + 40) continue;
-    const st = S.fuelStatus[f.id]?.status;
-    const col = st === 'ok' ? '#3ddc84' : st === 'bad' ? '#ff5a5f' : '#8a98a8';
-    const r = 7 * DPR;
+    const col = st === 'ok' ? '#3ddc84' : st === 'bad' ? '#ff5a5f' : '#c08a3e';
+    const r = (st || isTarget ? 5 : 4) * DPR;
     ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill();
-    ctx.fillStyle = '#0b0f14'; ctx.font = `bold ${9 * DPR}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('⛽', p[0], p[1] + 0.5 * DPR);
-    if (v.scale > 1.2) { ctx.fillStyle = col; ctx.font = `${10 * DPR}px sans-serif`; ctx.textBaseline = 'alphabetic'; ctx.fillText(f.brand || f.name || '', p[0], p[1] - r - 3 * DPR); }
-    if (S.target && S.target.id === f.id) { ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2 * DPR; ctx.beginPath(); ctx.arc(p[0], p[1], r + 5 * DPR, 0, 7); ctx.stroke(); }
+    ctx.strokeStyle = '#0b0f14'; ctx.lineWidth = 1.5 * DPR; ctx.stroke();
+    if (v.scale > 1.6) { ctx.fillStyle = col; ctx.font = `${10 * DPR}px sans-serif`; ctx.textBaseline = 'alphabetic'; ctx.fillText(f.brand || f.name || '', p[0], p[1] - r - 4 * DPR); }
+    if (isTarget) { ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2 * DPR; ctx.beginPath(); ctx.arc(p[0], p[1], r + 6 * DPR, 0, 7); ctx.stroke(); }
   }
   // ціль (адреса)
   if (S.target && S.target.kind === 'addr') {
@@ -210,10 +230,6 @@ function draw() {
     for (const q of eng.pf.p) { const p = worldToScreen(...g.pointOnEdge(q.e, q.s)); ctx.fillRect(p[0] - DPR, p[1] - DPR, 2 * DPR, 2 * DPR); }
   }
   // «правда» в демо
-  if (S.demo && S.demo.truth) {
-    const t = S.demo.truth; const p = worldToScreen(t.x, t.y);
-    ctx.strokeStyle = '#3ddc84'; ctx.lineWidth = 2 * DPR; ctx.setLineDash([4 * DPR, 3 * DPR]); ctx.beginPath(); ctx.arc(p[0], p[1], 10 * DPR, 0, 7); ctx.stroke(); ctx.setLineDash([]);
-  }
   // позиція
   if (eng && eng.state.xy) {
     const st = eng.state; const p = worldToScreen(...st.xy);
@@ -270,104 +286,139 @@ function onTap(sx, sy) {
     const bi = S.bld ? S.bld.nearest(p, 60) : -1;
     toast(bi >= 0 ? `Позицію встановлено біля ${S.bld.label(bi)}` : 'Позицію встановлено'); draw(); return;
   }
-  // тап по АЗС
+  // тап по АЗС — одразу пропонуємо маршрут
   let best = null, bd = 25 / S.view.scale;
   for (const f of S.fuel) { const d = dist(p, [f.x, f.y]); if (d < bd) { bd = d; best = f; } }
-  if (best) { openFuel(best); return; }
+  if (best) {
+    const item = { kind: 'fuel', id: best.id, x: best.x, y: best.y, name: best.name || best.brand || 'АЗС' };
+    S.target = item; recentAdd(item); routeTo(item); return;
+  }
+  // тап по будинку — показуємо адресу
+  if (S.bld && S.view.scale >= 0.8) {
+    const i = S.bld.nearest(p, 40 / S.view.scale);
+    if (i >= 0) { toast(S.bld.label(i)); return; }
+  }
 }
 
 // ---------- АЗС ----------
 function setFuelStatus(id, status) {
   if (status) S.fuelStatus[id] = { status, t: Date.now() }; else delete S.fuelStatus[id];
   localStorage.setItem('navi.fuelStatus', JSON.stringify(S.fuelStatus));
-  renderFuelList(); draw();
+  renderSearch(); draw();
 }
 function ago(t) { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'щойно' : m < 60 ? `${m} хв тому` : m < 1440 ? `${Math.round(m / 60)} год тому` : `${Math.round(m / 1440)} дн тому`; }
-function renderFuelList() {
-  const here = S.engine?.state.xy || [S.view.cx, S.view.cy];
-  const list = S.fuel.map(f => ({ f, d: dist(here, [f.x, f.y]) })).sort((a, b) => a.d - b.d).slice(0, 25);
-  $('fuelList').innerHTML = list.map(({ f, d }) => {
-    const st = S.fuelStatus[f.id];
-    return `<div class="row" data-id="${f.id}">
-      <div class="name">${f.name || f.brand || 'АЗС'}<small>${f.brand && f.name !== f.brand ? f.brand + ' · ' : ''}${d < 1000 ? Math.round(d) + ' м' : (d / 1000).toFixed(1) + ' км'}${st ? ' · ' + (st.status === 'ok' ? 'працює' : 'не працює') + ', ' + ago(st.t) : ' · статус невідомий'}</small></div>
-      <div class="seg"><button data-st="ok" class="${st?.status === 'ok' ? 'on ok' : ''}">працює</button><button data-st="bad" class="${st?.status === 'bad' ? 'on bad' : ''}">ні</button><button data-st="">?</button></div>
-      <button data-go="${f.id}" style="flex:none">→</button></div>`;
-  }).join('');
-}
-$('fuelList').addEventListener('click', (e) => {
-  const b = e.target.closest('button'); if (!b) return;
-  const id = b.closest('.row').dataset.id;
-  if (b.dataset.go !== undefined) { routeTo(S.fuel.find(f => f.id === id)); closeSheets(); return; }
-  setFuelStatus(id, b.dataset.st || null);
-});
-function openFuel(f) { renderFuelList(); $('sheetFuel').classList.add('show'); const row = $('fuelList').querySelector(`[data-id="${f.id}"]`); row?.scrollIntoView({ block: 'center' }); row && (row.style.background = 'rgba(77,163,255,.12)'); }
-
 // ---------- маршрут ----------
 function routeTo(f) {
-  if (!S.engine?.state.xy) { toast('Спочатку визначте позицію («Я тут» або GPS)'); return; }
+  const st = S.engine?.state;
+  if (!st?.xy) { toast('Спочатку визначте позицію: «Я тут» або ⋯ → «Визначити по мережі»'); return; }
   const g = S.graph;
-  const froms = [S.engine.state.edge ? S.engine.state.edge.b : null, ...g.nearestNodes(S.engine.state.xy, 400, 2, 4)].filter(x => x !== null);
-  const tos = [...g.nearestNodes([f.x, f.y], 400, 2, 6), g.nearestNode([f.x, f.y])];
+  // Беремо кілька варіантів старту й фінішу: вузол може виявитись у глухому куті
+  // або в маленькій відрізаній частині графа, тоді пробуємо наступний.
+  const froms = [st.edge ? st.edge.b : null, ...g.nearestNodes(st.xy, 600, 1, 6)].filter(x => x !== null);
+  const tos = [...g.nearestNodes([f.x, f.y], 600, 1, 8), g.nearestNode([f.x, f.y])];
   let r = null;
   for (const from of froms) { for (const to of tos) { r = route(g, from, to, S.traffic.speedFn(), VMAX); if (r) break; } if (r) break; }
-  if (!r) { toast('Маршрут не знайдено'); return; }
+  if (!r) {
+    toast(`Не вдалося прокласти шлях до «${f.name || 'цілі'}» — можливо, туди немає проїзду по карті`);
+    S.target = f; S.follow = false; S.view.cx = f.x; S.view.cy = f.y; draw();
+    return;
+  }
   S.routeInfo = r; S.target = f; S.routeSteps = instructions(g, r); S.lastSpoken = null;
-  const msg = `Маршрут: ${(r.length / 1000).toFixed(1)} км · ~${Math.max(1, Math.round(r.time / 60))} хв`;
-  toast(msg + (S.traffic.hasData ? ' з урахуванням типових пробок' : ''));
-  S.voice?.say(`Маршрут побудовано, ${(r.length / 1000).toFixed(1).replace('.', ' і ')} кілометра`, 'route', 0);
+  S.follow = true;
+  const km = (r.length / 1000).toFixed(1), min = Math.max(1, Math.round(r.time / 60));
+  toast(`${f.name || 'Маршрут'} · ${km} км · ~${min} хв`);
+  S.voice?.say(`Маршрут побудовано, ${km.replace('.', ' і ')} кілометра, приблизно ${min} хвилин`, 'route', 0);
   draw(); updateTurn();
 }
-function routeToNearestWorking() {
-  const here = S.engine?.state.xy; if (!here) { toast('Спочатку визначте позицію («Я тут» або GPS)'); return; }
-  const ok = S.fuel.filter(f => S.fuelStatus[f.id]?.status === 'ok');
-  const pool = ok.length ? ok : S.fuel.filter(f => S.fuelStatus[f.id]?.status !== 'bad');
-  if (!pool.length) { toast('Немає АЗС без позначки «не працює»'); return; }
-  const best = pool.map(f => ({ f, d: dist(here, [f.x, f.y]) })).sort((a, b) => a.d - b.d)[0].f;
-  if (!ok.length) toast('Робочих АЗС не позначено — веду до найближчої з невідомим статусом');
-  routeTo(best);
-}
+
 function updateTurn() {
   const el = $('turn');
-  if (!S.routeInfo || !S.engine?.state.edge) { el.classList.remove('show'); return; }
-  const g = S.graph, st = S.engine.state;
-  // знайти поточне ребро у маршруті; якщо немає — перебудувати
-  const idx = S.routeInfo.edges.indexOf(st.edge.id);
-  if (idx < 0) { if (S.target) { const from = st.edge.b; let r = null; for (const to of g.nearestNodes([S.target.x, S.target.y], 400, 2, 6)) { r = route(g, from, to, S.traffic.speedFn(), VMAX); if (r) break; } if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); } } el.classList.remove('show'); return; }
-  // відстань до наступного повороту
-  let d = st.edge.len - (st.s ?? 0), text = 'Прибуття', arrow = '🏁';
-  for (let i = idx + 1; i < S.routeInfo.edges.length; i++) {
-    const e = g.edge(S.routeInfo.edges[i]), prev = g.edge(S.routeInfo.edges[i - 1]);
+  const g = S.graph, st = S.engine?.state;
+  if (!S.routeInfo || !st?.edge) { el.classList.remove('show'); return; }
+
+  const edges = S.routeInfo.edges;
+  let idx = edges.indexOf(st.edge.id);
+  let d;           // відстань до наступного маневру
+  let from;        // з якого ребра маршруту рахувати повороти
+  if (idx >= 0) {
+    d = st.edge.len - (st.s ?? 0);
+    from = idx;
+  } else if (edges.length && g.a[edges[0]] === st.edge.b) {
+    // Ще не на маршруті, але прямуємо в його початок — підказка вже потрібна
+    d = st.edge.len - (st.s ?? 0);
+    from = -1;
+  } else {
+    // З'їхали з маршруту — перебудовуємо від поточного місця
+    if (S.target && S.rebuildAt !== st.edge.id) {
+      S.rebuildAt = st.edge.id;
+      const r = route(g, st.edge.b, g.nearestNode([S.target.x, S.target.y]), S.traffic.speedFn(), VMAX);
+      if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; toast('Перебудовую маршрут'); }
+    }
+    el.classList.remove('show');
+    return;
+  }
+
+  let text = 'Прибуття', spoken = 'Прибуття', arrow = '🏁', turnKey = 'end';
+  for (let i = from + 1; i < edges.length; i++) {
+    const e = g.edge(edges[i]);
+    const prev = i === 0 ? st.edge : g.edge(edges[i - 1]);
     const deg = angleDiff(e.hdg, prev.hdg) * 180 / Math.PI;
-    if (Math.abs(deg) > 30) { text = (deg > 0 ? 'праворуч' : 'ліворуч') + (e.name ? ' на ' + e.name : ''); arrow = deg > 0 ? '↱' : '↰'; break; }
+    if (Math.abs(deg) > 30) {
+      const dir = deg > 0 ? 'праворуч' : 'ліворуч';
+      text = dir + (e.name ? ', ' + shortStreet(e.name) : '');
+      spoken = dir + (e.name ? ', ' + e.name : '');
+      arrow = deg > 0 ? '↱' : '↰'; turnKey = i + '|' + text;
+      break;
+    }
     d += e.len;
   }
+
   $('turnDist').textContent = `${arrow} ${d < 1000 ? Math.round(d / 10) * 10 + ' м' : (d / 1000).toFixed(1) + ' км'}`;
-  $('turnText').textContent = text; el.classList.add('show');
-  // голос: на 500 м, 200 м і ~60 м до повороту (кожен поріг — один раз на поворот)
+  $('turnText').textContent = text;
+  el.classList.add('show');
+  hint('');
+
+  // голос: на 500 м, 200 м і перед самим поворотом — по одному разу на маневр
   const stage = d > 500 ? 0 : d > 200 ? 1 : d > 60 ? 2 : 3;
-  const key = idx + '|' + text;
-  if (!S.lastSpoken || S.lastSpoken.key !== key) S.lastSpoken = { key, stage: -1 };
-  if (stage > S.lastSpoken.stage && stage >= 1) { S.lastSpoken.stage = stage; S.voice?.say(turnPhrase(stage === 3 ? 0 : stage === 2 ? 200 : 500, text), key + stage, 0); }
-  if (d < 30 && text === 'Прибуття') { toast('Ви на місці'); S.voice?.say('Ви прибули', 'arrive', 0); S.routeInfo = null; S.target = null; el.classList.remove('show'); }
+  if (!S.lastSpoken || S.lastSpoken.key !== turnKey) S.lastSpoken = { key: turnKey, stage: -1 };
+  if (stage > S.lastSpoken.stage && stage >= 1) {
+    S.lastSpoken.stage = stage;
+    S.voice?.say(turnPhrase(stage === 3 ? 0 : stage === 2 ? 200 : 500, spoken), turnKey + stage, 0);
+  }
+  if (d < 30 && turnKey === 'end') {
+    toast('Ви на місці'); S.voice?.say('Ви прибули', 'arrive', 0);
+    S.routeInfo = null; S.target = null; el.classList.remove('show');
+  }
 }
 
 // ---------- датчики та GPS ----------
 async function startSensors() {
   if (S.sensorsOn) { stopSensors(); return; }
+  // Позицію вмикаємо завжди й першою: навіть якщо датчики руху заборонені або їх немає,
+  // мережа зв'язку дасть хоча б грубе місцезнаходження.
+  S.sensorsOn = true;
+  $('btnSensors').textContent = '⏹ Стоп'; $('btnSensors').classList.remove('primary');
+  startGps(); requestWakeLock();
+
+  let motion = true;
   try {
     if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-      const r = await DeviceMotionEvent.requestPermission(); if (r !== 'granted') { toast('Немає дозволу на датчики руху'); return; }
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== 'granted') { motion = false; toast('Без дозволу на рух вестиму лише по мережі — точність буде гіршою'); }
     }
-  } catch (e) { toast('Дозвіл на датчики: ' + e.message); }
-  if (!('DeviceMotionEvent' in window)) { toast('Датчики руху недоступні в цьому браузері'); return; }
-  S.t0 = null;
-  addEventListener('devicemotion', onMotion);
-  S.sensorsOn = true; $('btnSensors').textContent = '⏹ Датчики'; $('btnSensors').classList.remove('primary');
-  startGps(); requestWakeLock();
-  hint('Закріпіть телефон у тримачі. Перші секунди стійте на місці, потім рушайте — застосунок сам визначить, де «вперед».');
-  setTimeout(() => hint(''), 9000);
+  } catch (e) { motion = false; toast('Датчики руху недоступні: ' + e.message); }
+  if (!('DeviceMotionEvent' in window)) { motion = false; toast('Цей браузер не дає датчиків руху — лише груба позиція по мережі'); }
+
+  if (motion) {
+    S.t0 = null;
+    addEventListener('devicemotion', onMotion);
+    hint('Закріпіть телефон у тримачі. Перші секунди стійте на місці, потім рушайте — застосунок сам визначить, де «вперед».');
+    setTimeout(() => hint(''), 9000);
+  }
+  S.motionOn = motion;
 }
-function stopSensors() { removeEventListener('devicemotion', onMotion); S.sensorsOn = false; $('btnSensors').textContent = '▶ Датчики'; $('btnSensors').classList.add('primary'); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
+
+function stopSensors() { removeEventListener('devicemotion', onMotion); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; $('btnSensors').textContent = '▶ Старт'; $('btnSensors').classList.add('primary'); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
 function onMotion(e) {
   const ag = e.accelerationIncludingGravity, rr = e.rotationRate;
   if (!ag || ag.x == null || !rr || rr.alpha == null) return;
@@ -377,65 +428,49 @@ function onMotion(e) {
   S.engine.pushMotion({ t, acc: [ag.x, ag.y, ag.z], gyro: [rr.beta * D2R, rr.gamma * D2R, rr.alpha * D2R] });
 }
 function startGps() {
-  if (!('geolocation' in navigator)) return;
+  if (!('geolocation' in navigator)) { $('txtGps').textContent = 'Геолокація недоступна'; return; }
+  // 1) Спершу просимо грубу позицію: її iOS бере з веж зв'язку та Wi-Fi, без супутників.
+  //    Вона приходить за секунду-дві й працює там, де РЕБ глушить GPS.
+  locateByNetwork(true);
+  // 2) Паралельно — звичайне стеження з максимальною точністю (супутники, коли є).
   S.gpsWatch = navigator.geolocation.watchPosition((pos) => {
     const c = pos.coords;
+    S.lastFixAt = Date.now();
     S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed });
-    // якщо немає GPS-фіксу всередині карти — повідомити
-  }, (err) => { $('txtGps').textContent = 'GPS: ' + (err.code === 1 ? 'заборонено' : 'немає сигналу'); $('dotGps').className = 'dot bad'; }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
+  }, (err) => {
+    if (err.code === 1) { $('txtGps').textContent = 'Геолокація заборонена'; $('dotGps').className = 'dot bad'; }
+  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
+  // 3) Кожні 25 с перепитуємо грубу позицію — це незалежне джерело, яким можна
+  //    і підстрахувати дрейф, і впіймати підміну координат.
+  clearInterval(S.netTimer);
+  S.netTimer = setInterval(() => locateByNetwork(false), 25000);
 }
+
+// Груба позиція «по мережі»: enableHighAccuracy:false просить систему не вмикати
+// супутниковий приймач, тож відповідь приходить від веж зв'язку / Wi-Fi.
+function locateByNetwork(initial) {
+  if (!('geolocation' in navigator)) return;
+  S.netPending = true;
+  navigator.geolocation.getCurrentPosition((pos) => {
+    S.netPending = false;
+    const c = pos.coords;
+    S.lastNetAt = Date.now();
+    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: null });
+    if (initial) {
+      const a = Math.round(c.accuracy);
+      toast(a <= 40 ? 'Позицію визначено по супутниках' : `Позицію визначено по мережі зв'язку, ±${a < 1000 ? a + ' м' : (a / 1000).toFixed(1) + ' км'} — уточню під час руху`);
+      S.follow = true;
+    }
+  }, (err) => {
+    S.netPending = false;
+    if (initial && err.code !== 1) toast('Позицію по мережі визначити не вдалося — вкажіть її кнопкою «Я тут»');
+  }, { enableHighAccuracy: false, maximumAge: initial ? 60000 : 10000, timeout: 20000 });
+}
+
 let wakeLock = null;
 async function requestWakeLock() { try { if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); document.addEventListener('visibilitychange', async () => { if (document.visibilityState === 'visible' && S.sensorsOn) wakeLock = await navigator.wakeLock.request('screen'); }); } } catch { } }
 
 // ---------- демо ----------
-// Випадковий вузол неподалік центру екрана (на великій карті — у радіусі ~2.5 км)
-function randomNode() {
-  const g = S.graph;
-  if (g.nNodes < 5000) return Math.floor(Math.random() * g.nNodes);
-  for (let t = 0; t < 50; t++) {
-    const p = [S.view.cx + (Math.random() - 0.5) * 5000, S.view.cy + (Math.random() - 0.5) * 5000];
-    const ids = g.edgesInBox(p[0] - 300, p[1] - 300, p[0] + 300, p[1] + 300, 2);
-    if (ids.length) return g.a[ids[Math.floor(Math.random() * ids.length)]];
-  }
-  return Math.floor(Math.random() * g.nNodes);
-}
-function startDemo() {
-  if (S.demo) { stopDemo(); return; }
-  const g = S.graph;
-  // випадкова поїздка завдовжки понад 1.5 км
-  let sim = null;
-  for (let tries = 0; tries < 30 && !sim; tries++) {
-    const a = randomNode(), b = randomNode();
-    if (dist(g.nodeXY(a), g.nodeXY(b)) < 1200) continue;
-    try { sim = simulateDrive(g, a, b, { seed: Math.floor(Math.random() * 1e6), ios: true, hz: 50 }); } catch { }
-  }
-  if (!sim) { toast('Не вдалося згенерувати поїздку'); return; }
-  S.engine = new NavEngine(g, { motion: { gravitySign: -1 } });
-  S.engine.setPositionXY([sim.truth[0].x, sim.truth[0].y], 100);
-  S.demo = { sim, i: 0, truth: sim.truth[0], gpsUntil: 40, lastGps: -10, t0: performance.now(), speedup: 2 };
-  S.routeInfo = null; S.target = null; S.follow = true;
-  $('btnDemo').textContent = '⏹ Демо'; $('btnDemo').classList.add('active');
-  hint('Демо: зелене пунктирне коло — справжнє положення авто, синя стрілка — оцінка без GPS. GPS «працює» лише перші 40 с, далі — РЕБ.');
-  setTimeout(() => hint(''), 8000);
-  requestAnimationFrame(demoTick);
-}
-function stopDemo() { S.demo = null; $('btnDemo').textContent = '🎬 Демо'; $('btnDemo').classList.remove('active'); }
-function demoTick(now) {
-  const d = S.demo; if (!d) return;
-  const simT = (now - d.t0) / 1000 * d.speedup;
-  while (d.i < d.sim.samples.length && d.sim.samples[d.i].t <= simT) {
-    const s = d.sim.samples[d.i], tr = d.sim.truth[d.i];
-    S.engine.pushMotion(s);
-    if (s.t < d.gpsUntil && s.t - d.lastGps >= 1) {
-      d.lastGps = s.t; const [lat, lon] = S.engine.proj.toLL(tr.x + (Math.random() - .5) * 10, tr.y + (Math.random() - .5) * 10);
-      S.engine.pushGps({ t: s.t, lat, lon, accuracy: 8, speed: tr.v });
-    } else if (s.t >= d.gpsUntil) { S.engine.state.gps = 'jammed'; }
-    d.truth = tr; d.i++;
-  }
-  if (d.i >= d.sim.samples.length) { toast('Демо-поїздка завершена'); stopDemo(); }
-  requestAnimationFrame(demoTick);
-}
-
 // ---------- інтерфейс ----------
 function toast(msg) { const t = $('toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 3500); }
 function hint(msg) { const h = $('hint'); h.textContent = msg; h.classList.toggle('show', !!msg); }
@@ -443,71 +478,183 @@ function closeSheets() { document.querySelectorAll('.sheet').forEach(s => s.clas
 document.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => $(b.dataset.close).classList.remove('show')));
 
 $('btnSensors').addEventListener('click', () => { S.voice?.warmup(); startSensors(); });
-$('btnDemo').addEventListener('click', () => S.voice?.warmup(), { capture: true });
 $('btnHere').addEventListener('click', () => { S.hereMode = !S.hereMode; $('btnHere').classList.toggle('active', S.hereMode); hint(S.hereMode ? 'Перетягніть карту так, щоб перехрестя, на якому ви стоїте, було під прицілом, і торкніться його.' : ''); draw(); });
-$('btnFuel').addEventListener('click', () => { renderFuelList(); $('sheetFuel').classList.add('show'); });
-$('btnRoute').addEventListener('click', routeToNearestWorking);
-$('btnSearch').addEventListener('click', () => { if (!S.bld) { toast('Адреси ще не завантажені (немає data/buildings.bin)'); return; } $('sheetSearch').classList.add('show'); $('addrInput').value = ''; $('addrList').innerHTML = ''; setTimeout(() => $('addrInput').focus(), 50); });
-$('addrInput').addEventListener('input', () => {
-  const q = $('addrInput').value; const near = S.engine?.state.xy || [S.view.cx, S.view.cy];
-  const res = S.bld.search(q, near);
-  $('addrList').innerHTML = res.map((r, k) => `<div class="row" data-k="${k}"><div class="name">${r.text}<small>${r.d < 1000 ? Math.round(r.d) + ' м' : (r.d / 1000).toFixed(1) + ' км'}</small></div><button data-show="${k}" style="flex:none">Показати</button><button data-go="${k}" style="flex:none">→</button></div>`).join('') || (q.length > 1 ? '<div class="row"><div class="name" style="color:var(--muted)">Нічого не знайдено. Спробуйте «Хрещатик 22».</div></div>' : '');
-  S._addrRes = res;
+// ---------- єдиний пошук: адреси, вулиці, АЗС ----------
+const fmtDist = (d) => d < 1000 ? Math.round(d) + ' м' : (d / 1000).toFixed(1) + ' км';
+const recentGet = () => { try { return JSON.parse(localStorage.getItem('navi.recent') || '[]'); } catch { return []; } };
+function recentAdd(item) {
+  const list = recentGet().filter(r => !(r.kind === item.kind && r.name === item.name));
+  list.unshift({ kind: item.kind, name: item.name, x: item.x, y: item.y, id: item.id || null });
+  try { localStorage.setItem('navi.recent', JSON.stringify(list.slice(0, 8))); } catch { }
+}
+
+function openSearch() {
+  $('sheetSearch').classList.add('show');
+  $('addrInput').value = '';
+  renderSearch();
+  setTimeout(() => $('addrInput').focus(), 50);
+}
+
+// Збирає результати за запитом. Порожній запит показує нещодавні цілі та АЗС поруч.
+function searchItems(q, tab) {
+  const here = S.engine?.state.xy || [S.view.cx, S.view.cy];
+  const D = (x, y) => Math.hypot(x - here[0], y - here[1]);
+  const out = [];
+  const norm = (t) => (t || '').toLowerCase().replace(/[’'`ʼ]/g, '').replace(/ґ/g, 'г');
+  const qn = norm(q).trim();
+
+  if (!qn) {
+    if (tab !== 'fuel') for (const r of recentGet()) out.push({ ...r, sub: 'нещодавнє', d: D(r.x, r.y), group: 'Нещодавні' });
+    if (tab !== 'addr') {
+      const near = S.fuel.map(f => ({ f, d: D(f.x, f.y) })).sort((a, b) => a.d - b.d).slice(0, 10);
+      for (const { f, d } of near) out.push(fuelItem(f, d));
+    }
+    return out;
+  }
+
+  if (tab !== 'addr') {
+    for (const f of S.fuel) {
+      if (!norm(f.name).includes(qn) && !norm(f.brand).includes(qn)) continue;
+      out.push(fuelItem(f, D(f.x, f.y)));
+      if (out.length > 40) break;
+    }
+    out.sort((a, b) => a.d - b.d);
+  }
+  if (tab !== 'fuel' && S.bld && qn.length >= 2) {
+    for (const r of S.bld.search(q, here, 20)) {
+      out.push({ kind: r.streetOnly ? 'street' : 'addr', name: r.text, x: r.x, y: r.y, d: r.d,
+                 sub: r.streetOnly ? 'вулиця' : 'адреса', group: 'Адреси' });
+    }
+  }
+  return out.slice(0, 40);
+}
+
+function fuelItem(f, d) {
+  const st = S.fuelStatus[f.id];
+  const sub = st ? (st.status === 'ok' ? 'працює · ' : 'не працює · ') + ago(st.t) : 'статус невідомий';
+  return { kind: 'fuel', id: f.id, name: f.name || f.brand || 'АЗС', x: f.x, y: f.y, d, sub, group: 'АЗС' };
+}
+
+function renderSearch() {
+  const q = $('addrInput').value;
+  if (!S.bld && !S.fuel.length) { $('addrList').innerHTML = '<div class="row"><div class="name" style="color:var(--muted)">Завантажую дані…</div></div>'; return; }
+  const items = searchItems(q, S.searchTab);
+  S._res = items;
+  if (!items.length) {
+    $('addrList').innerHTML = `<div class="row"><div class="name" style="color:var(--muted)">${q.trim() ? 'Нічого не знайдено. Спробуйте «Хрещатик 22» або «ОККО».' : 'Почніть вводити адресу або назву'}</div></div>`;
+    return;
+  }
+  let html = '', group = '';
+  items.forEach((r, k) => {
+    if (r.group !== group) { group = r.group; html += `<div style="color:var(--muted);font-size:13px;margin:10px 0 2px">${group}</div>`; }
+    const icon = r.kind === 'fuel' ? '⛽' : r.kind === 'street' ? '🛣' : '🏠';
+    const status = r.kind === 'fuel' ? `<div class="seg"><button data-st="ok" data-k="${k}" class="${S.fuelStatus[r.id]?.status === 'ok' ? 'on ok' : ''}">є</button><button data-st="bad" data-k="${k}" class="${S.fuelStatus[r.id]?.status === 'bad' ? 'on bad' : ''}">нема</button></div>` : '';
+    html += `<div class="row"><div class="name">${icon} ${r.name}<small>${r.sub} · ${fmtDist(r.d)}</small></div>${status}<button data-show="1" data-k="${k}" style="flex:none">👁</button><button data-go="1" data-k="${k}" style="flex:none">Маршрут</button></div>`;
+  });
+  $('addrList').innerHTML = html;
+}
+
+$('btnSearch').addEventListener('click', openSearch);
+$('btnCenter').addEventListener('click', () => {
+  const st = S.engine?.state;
+  if (!st?.xy) { toast('Позицію ще не визначено'); return; }
+  S.follow = true; S.view.scale = Math.max(S.view.scale, 1.2);
+  S.view.cx = st.xy[0]; S.view.cy = st.xy[1]; draw();
+});
+$('addrInput').addEventListener('input', renderSearch);
+document.querySelector('#sheetSearch .tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  S.searchTab = b.dataset.tab;
+  document.querySelectorAll('#sheetSearch .tabs button').forEach(x => x.classList.toggle('on', x === b));
+  renderSearch();
 });
 $('addrList').addEventListener('click', (e) => {
   const b = e.target.closest('button'); if (!b) return;
-  const r = S._addrRes[+(b.dataset.go ?? b.dataset.show)]; if (!r) return;
+  const r = S._res[+b.dataset.k];
+  if (!r) return;
+  if (b.dataset.st !== undefined) {  // позначка статусу АЗС
+    const cur = S.fuelStatus[r.id]?.status;
+    setFuelStatus(r.id, cur === b.dataset.st ? null : b.dataset.st);
+    renderSearch();
+    return;
+  }
   closeSheets();
-  if (b.dataset.show !== undefined || !S.engine?.state.xy) { S.follow = false; S.view.cx = r.x; S.view.cy = r.y; S.view.scale = Math.max(S.view.scale, 1.8); S.target = { kind: 'addr', x: r.x, y: r.y, name: r.text }; draw(); if (!S.engine?.state.xy && b.dataset.go !== undefined) toast('Спочатку визначте позицію («Я тут» або GPS)'); return; }
-  routeTo({ kind: 'addr', id: 'addr', x: r.x, y: r.y, name: r.text });
+  S.target = { kind: r.kind, id: r.id, x: r.x, y: r.y, name: r.name };
+  if (b.dataset.show !== undefined) {
+    S.follow = false; S.view.cx = r.x; S.view.cy = r.y; S.view.scale = Math.max(S.view.scale, 1.8);
+    draw(); toast(r.name);
+    return;
+  }
+  recentAdd(r);
+  routeTo(S.target);
 });
-$('btnDemo').addEventListener('click', startDemo);
-$('btnMore').addEventListener('click', () => $('sheetMore').classList.add('show'));
-$('btnFlip').addEventListener('click', () => { S.engine.flipTurns(); toast('Знак поворотів перемкнено'); });
-$('btnParticles').addEventListener('click', () => { S.showParticles = !S.showParticles; draw(); });
-$('btnRotate').addEventListener('click', () => { S.view.rotate = !S.view.rotate; draw(); });
+
+$('btnLocateNet').addEventListener('click', () => {
+  if (!('geolocation' in navigator)) { toast('Геолокація недоступна в цьому браузері'); return; }
+  toast("Питаю позицію по мережі зв'язку…"); closeSheets(); locateByNetwork(true);
+});
+$('btnVoice').addEventListener('click', () => { S.voice.setEnabled(!S.voice.enabled); S.voice.warmup(); toast(S.voice.enabled ? (S.voice.hasUk ? 'Голос увімкнено' : 'Голос увімкнено, але українського голосу в системі немає — буде англійський') : 'Голос вимкнено'); $('voiceState').textContent = S.voice.enabled ? 'увімкнено' : 'вимкнено'; });
 function updateTrafficInfo() {
   const st = S.traffic.stats();
   $('trafficInfo').textContent = st.edges ? `${st.edges} ділянок, ${st.hours.toFixed(1)} год поїздок` : 'ще нічого не записано';
 }
-$('btnVoice').addEventListener('click', () => { S.voice.setEnabled(!S.voice.enabled); S.voice.warmup(); toast(S.voice.enabled ? (S.voice.hasUk ? 'Голос увімкнено' : 'Голос увімкнено, але українського голосу в системі немає — буде англійський') : 'Голос вимкнено'); $('voiceState').textContent = S.voice.enabled ? 'увімкнено' : 'вимкнено'; });
 $('btnTraffic').addEventListener('click', () => { S.showTraffic = !S.showTraffic; toast(S.showTraffic ? 'Шар пробок увімкнено' : 'Шар пробок вимкнено'); draw(); });
 $('btnTrafficClear').addEventListener('click', () => { S.traffic.clear(); updateTrafficInfo(); draw(); toast('Пам\'ять пробок очищено'); });
-$('btnTrafficDemo').addEventListener('click', () => {
-  // Швидко «наїжджаємо» історію: 25 випадкових поїздок по тестовому місту за годинником зараз
-  const g = S.graph; let n = 0;
-  for (let k = 0; k < 25; k++) {
-    const a = randomNode(), b = randomNode();
-    if (dist(g.nodeXY(a), g.nodeXY(b)) < 800) continue;
-    let sim; try { sim = simulateDrive(g, a, b, { seed: Math.floor(Math.random() * 1e6), hz: 10 }); } catch { continue; }
-    let cur = -1, time = 0, distM = 0, lastT = 0;
-    for (const tr of sim.truth) {
-      const eid = sim.route.edges[tr.seg];
-      if (eid !== cur) { if (cur >= 0) S.traffic.observe(cur, time, distM); cur = eid; time = 0; distM = 0; }
-      const dt = tr.t - lastT; lastT = tr.t; time += dt; distM += tr.v * dt;
-    }
-    if (cur >= 0) S.traffic.observe(cur, time, distM);
-    n++;
-  }
-  S.traffic.save(); updateTrafficInfo(); closeSheets(); draw();
-  toast(`Записано ${n} демо-поїздок — червоним показано типово повільні вулиці о цій годині`);
-});
 setInterval(updateTrafficInfo, 10000);
 $('btnRec').addEventListener('click', () => {
   if (!S.recording) { S.engine.startRecording(); S.recording = true; $('btnRec').textContent = 'Стоп і зберегти'; toast('Запис датчиків увімкнено'); }
   else { const log = S.engine.stopRecording(); S.recording = false; $('btnRec').textContent = 'Старт'; const blob = new Blob([JSON.stringify({ origin: S.graph.origin, log })], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `navi-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`; document.body.appendChild(a); a.click(); a.remove(); toast(`Збережено ${log.length} записів`); }
 });
 
+// Поточне місце словами: вулиця, по якій їдемо, і найближчий будинок з номером.
+let whereCache = { t: 0, text: '' };
+function updateWhere() {
+  const st = S.engine?.state;
+  const el = $('where');
+  if (!st || !st.xy) { el.innerHTML = ''; return; }
+  const now = Date.now();
+  if (now - whereCache.t < 1500) { el.innerHTML = whereCache.text ? `<span>${whereCache.text}</span>` : ''; return; }
+  whereCache.t = now;
+  let street = st.edge && st.edge.name ? st.edge.name : '';
+  let house = '';
+  if (S.bld) { const i = S.bld.nearest(st.xy, 80); if (i >= 0) house = S.bld.label(i); }
+  // Якщо будинок на тій самій вулиці — не повторюємо її назву двічі
+  const sameStreet = street && house && normStreet(house).startsWith(normStreet(street));
+  let text;
+  if (house && (sameStreet || !street)) text = '📍 ' + house;
+  else if (house && street) text = `📍 ${street} · біля ${house}`;
+  else if (street) text = '📍 ' + street;
+  else text = '📍 поза вулицями';
+  whereCache.text = text;
+  el.innerHTML = `<span>${text}</span>`;
+}
+
 function updateStatus() {
   const eng = S.engine; if (!eng) return;
   const st = eng.state;
   $('speed').textContent = Math.round(st.speed * 3.6);
-  const gpsTxt = { none: 'GPS: нема даних', ok: 'GPS: є', rejected: 'GPS: ПІДМІНА — ігнорую', jammed: 'GPS: глушиться' }[st.gps] || 'GPS: —';
-  $('txtGps').textContent = gpsTxt; $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'rejected' ? 'warn' : st.gps === 'jammed' ? 'bad' : '');
+  if (S.sensorsOn) eng.noteGpsSilence(eng.lastStepT ?? 0);
+  const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
+  const gpsTxt = {
+    none: 'Позиції нема', ok: 'Супутники', weak: 'Wi-Fi / слабкий сигнал',
+    net: netAcc ? `Мережа зв'язку ±${netAcc}` : "Мережа зв'язку",
+    rejected: st.spoofByNet ? 'ПІДМІНА (не збігається з мережею)' : 'ПІДМІНА — ігнорую',
+    jammed: netAcc ? `GPS глушиться · мережа ±${netAcc}` : 'GPS глушиться',
+  }[st.gps] || '—';
+  $('txtGps').textContent = gpsTxt;
+  $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' ? 'bad' : '');
   const modeTxt = { init: 'немає позиції', calibrating: 'калібрую осі…', tracking: 'веду без GPS' }[st.mode] || st.mode;
   $('txtMode').textContent = modeTxt; $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? 'ok' : st.mode === 'calibrating' ? 'warn' : '');
-  $('conf').textContent = st.xy ? `упевненість ${Math.round(st.confidence * 100)}% · ±${Math.round(st.spread)} м` : 'упевненість —';
+  // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами
+  if (!st.xy) $('conf').textContent = 'позицію не визначено';
+  else {
+    const r = st.spread < 1000 ? Math.round(st.spread) + ' м' : (st.spread / 1000).toFixed(1) + ' км';
+    const word = st.spread < 40 && st.confidence > 0.5 ? 'точно' : st.spread < 150 ? 'приблизно' : 'уточнюю';
+    $('conf').textContent = `${word} ±${r}`;
+  }
   if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; }
+  $('btnCenter').classList.toggle('show', !S.follow && !!st.xy);
+  updateWhere();
   updateTurn();
 }
 // Пам'ять пробок: скільки часу й метрів проведено на кожному ребрі (за годинником датчиків)
@@ -550,5 +697,5 @@ function loop(now) {
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
   const seen = localStorage.getItem('navi.seen');
-  if (!seen) { hint('Це прототип навігації без GPS. Натисніть «Демо», щоб побачити, як працює алгоритм на тестовому місті, або «Датчики» в авто.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 12000); }
+  if (!seen) { hint('Натисніть «Старт»: застосунок знайде вас по мережі зв\'язку, а далі вестиме по датчиках і карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
 })();

@@ -15,19 +15,19 @@
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:16px/1.3 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif; overflow:hidden; touch-action:none; }
   #map { position:fixed; inset:0; display:block; }
-  .top { position:fixed; left:0; right:0; top:0; padding:calc(env(safe-area-inset-top) + 8px) 12px 8px; background:linear-gradient(var(--bg),transparent); pointer-events:none; }
+  .top { position:fixed; left:0; right:0; top:0; padding:calc(env(safe-area-inset-top) + 8px) 12px 8px; background:linear-gradient(var(--bg) 60%,transparent); pointer-events:none; display:flex; flex-direction:column; gap:8px; }
   .status { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:14px; }
   .pill { background:var(--panel); border-radius:999px; padding:6px 10px; display:inline-flex; gap:6px; align-items:center; pointer-events:auto; }
   .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); }
   .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
   .big { font-size:28px; font-weight:700; letter-spacing:-.5px; }
-  .hint { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 56px); background:var(--panel); border-radius:14px; padding:12px 14px; font-size:15px; display:none; }
+  .hint { background:var(--panel); border-radius:14px; padding:12px 14px; font-size:15px; display:none; }
   .hint.show { display:block; }
-  .turn { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 56px); background:var(--panel); border-left:6px solid var(--accent); border-radius:14px; padding:10px 14px; display:none; }
+  .turn { background:var(--panel); border-left:6px solid var(--accent); border-radius:14px; padding:10px 14px; display:none; }
   .turn.show { display:block; }
   .turn .d { font-size:30px; font-weight:800; } .turn .t { font-size:17px; color:var(--fg); }
-  .bottom { position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(env(safe-area-inset-bottom) + 10px); display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; background:linear-gradient(transparent,var(--bg)); }
-  .bottom #btnDemo { grid-column: span 2; }
+  .bottom { position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(env(safe-area-inset-bottom) + 10px); display:grid; grid-template-columns:repeat(4,1fr); gap:8px; background:linear-gradient(transparent,var(--bg)); pointer-events:none; }
+  .bottom button { pointer-events:auto; white-space:nowrap; padding:12px 6px; font-size:14px; }
   button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:12px 14px; font-size:15px; flex:1 1 auto; min-width:0; }
   button.primary { background:var(--accent); color:#06111f; font-weight:700; border-color:transparent; }
   button.active { outline:2px solid var(--accent); }
@@ -42,6 +42,13 @@
   .seg button { flex:none; border:0; border-radius:0; padding:8px 10px; font-size:13px; background:transparent; }
   .seg button.on.ok { background:var(--ok); color:#042; } .seg button.on.bad { background:var(--bad); color:#300; }
   .close { position:absolute; right:10px; top:8px; background:transparent; border:0; font-size:22px; padding:6px 10px; flex:none; }
+  .fab { position:fixed; right:12px; bottom:calc(env(safe-area-inset-bottom) + 76px); display:none; background:var(--panel); padding:10px 14px; font-size:14px; border-radius:999px; }
+  .fab.show { display:block; }
+  .where { font-size:14px; color:var(--fg); }
+  .where span { background:var(--panel); border-radius:999px; padding:6px 12px; display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tabs { display:flex; gap:6px; margin:8px 0; }
+  .tabs button { flex:1; padding:8px; font-size:14px; }
+  .tabs button.on { background:var(--accent); color:#06111f; font-weight:600; border-color:transparent; }
   .toast { position:fixed; left:50%; bottom:120px; transform:translateX(-50%); background:var(--panel); padding:10px 14px; border-radius:12px; font-size:14px; display:none; }
   .toast.show { display:block; }
 </style>
@@ -56,30 +63,28 @@
     <span class="pill"><span class="big" id="speed">0</span>&nbsp;км/год</span>
     <span class="pill" id="conf">упевненість —</span>
   </div>
+  <div class="turn" id="turn"><div class="d" id="turnDist"></div><div class="t" id="turnText"></div></div>
+  <div class="where" id="where"></div>
+  <div class="hint" id="hint"></div>
 </div>
-<div class="hint" id="hint"></div>
-<div class="turn" id="turn"><div class="d" id="turnDist"></div><div class="t" id="turnText"></div></div>
+
 
 <div class="bottom">
-  <button id="btnSensors" class="primary">▶ Датчики</button>
+  <button id="btnSensors" class="primary">▶ Старт</button>
+  <button id="btnSearch">🔍 Пошук</button>
   <button id="btnHere">📍 Я тут</button>
-  <button id="btnSearch">🔍 Адреса</button>
-  <button id="btnFuel">⛽ АЗС</button>
-  <button id="btnRoute">🧭 До АЗС</button>
-  <button id="btnDemo">🎬 Демо</button>
-  <button id="btnMore" style="flex:0 0 56px">⋯</button>
-</div>
-
-<div class="sheet" id="sheetFuel">
-  <button class="close" data-close="sheetFuel">✕</button>
-  <h3>АЗС поблизу</h3>
-  <div id="fuelList"></div>
+  <button id="btnMore">⋯</button>
 </div>
 
 <div class="sheet" id="sheetSearch">
   <button class="close" data-close="sheetSearch">✕</button>
-  <h3>Пошук адреси</h3>
-  <input id="addrInput" type="search" placeholder="вул. Хрещатик 22" autocomplete="off" style="width:100%;font:inherit;font-size:17px;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#0b0f14;color:var(--fg);margin-bottom:8px">
+  <h3>Куди їдемо?</h3>
+  <input id="addrInput" type="search" placeholder="Вулиця і номер, або назва АЗС" autocomplete="off" enterkeyhint="search" style="width:100%;font:inherit;font-size:17px;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#0b0f14;color:var(--fg)">
+  <div class="tabs">
+    <button data-tab="all" class="on">Усе</button>
+    <button data-tab="addr">Адреси</button>
+    <button data-tab="fuel">АЗС</button>
+  </div>
   <div id="addrList"></div>
 </div>
 
@@ -89,15 +94,16 @@
   <div class="row"><div class="name">Повороти дзеркальні<small>якщо на карті авто повертає не туди</small></div><button id="btnFlip">Перемкнути</button></div>
   <div class="row"><div class="name">Показувати частинки<small>хмара гіпотез фільтра</small></div><button id="btnParticles">Увімк/вимк</button></div>
   <div class="row"><div class="name">Карта на північ / за курсом</div><button id="btnRotate">Перемкнути</button></div>
+  <div class="row"><div class="name">Визначити по мережі зв'язку<small>вежі та Wi-Fi, працює без супутників</small></div><button id="btnLocateNet">Знайти</button></div>
   <div class="row"><div class="name">Голосові підказки<small id="voiceState"></small></div><button id="btnVoice">Увімк/вимк</button></div>
   <div class="row"><div class="name">Шар пробок<small>типова швидкість за вашими поїздками о цій годині</small></div><button id="btnTraffic">Увімк/вимк</button></div>
   <div class="row"><div class="name">Пам'ять пробок<small id="trafficInfo"></small></div><button id="btnTrafficClear">Очистити</button></div>
-  <div class="row"><div class="name">Наїздити історію (демо)<small>25 швидких поїздок по тестовому місту</small></div><button id="btnTrafficDemo">Запустити</button></div>
   <div class="row"><div class="name">Запис датчиків<small>для налагодження алгоритму на комп'ютері</small></div><button id="btnRec">Старт</button></div>
   <div class="row"><div class="name">Дані карти</div><div id="dataInfo" style="color:var(--muted);font-size:13px"></div></div>
-  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.4</div></div>
+  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.6</div></div>
 </div>
 
+<button id="btnCenter" class="fab">⌖ До себе</button>
 <div class="toast" id="toast"></div>
 <script type="module" src="js/app.js"></script>
 </body>

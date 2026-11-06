@@ -233,7 +233,15 @@ def main():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from graph_bin import write_bin, write_buildings
     write_bin(graph, os.path.join(a.out, 'graph.bin'))
-    nb, ne = write_buildings(h.buildings, h.entrances, os.path.join(a.out, 'buildings.bin'))
+    # Стиснення: будинки без адреси далі 25 км від центру — геть; контури лише з адресою або в межах ~12 км; ≤10 точок
+    slim = []
+    for bx, by, street, num, outline in h.buildings:
+        has_addr = bool(street and num); d = math.hypot(bx, by)
+        if not has_addr and d > 25000: continue
+        if not has_addr and d > 12000: outline = []
+        if len(outline) > 10: outline = [outline[i] for i in range(0, len(outline), max(1, len(outline) // 10))][:10]
+        slim.append((bx, by, street, num, outline))
+    nb, ne = write_buildings(slim, h.entrances, os.path.join(a.out, 'buildings.bin'))
     print(f'Будинків: {nb} (з адресою {sum(1 for b in h.buildings if b[2] and b[3])}), під\'їздів: {ne} → {a.out}/buildings.bin '
           f'({os.path.getsize(os.path.join(a.out, "buildings.bin")) / 1e6:.1f} МБ)')
     if a.json:

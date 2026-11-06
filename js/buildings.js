@@ -97,11 +97,15 @@ export class Buildings {
   }
 }
 
-const ABBR = [[/\bвулиця\b/g, ''], [/\bвул\.?\b/g, ''], [/\bпроспект\b/g, ''], [/\bпросп\.?\b/g, ''], [/\bпр-т\b/g, ''], [/\bпровулок\b/g, ''], [/\bпров\.?\b/g, ''], [/\bбульвар\b/g, ''], [/\bбул\.?\b/g, ''], [/\bплоща\b/g, ''], [/\bпл\.?\b/g, ''], [/\bшосе\b/g, ''], [/\bузвіз\b/g, ''], [/\bнабережна\b/g, ''], [/\bнаб\.?\b/g, ''], [/\bдорога\b/g, ''], [/\bпроїзд\b/g, '']];
+// Типи вулиць прибираємо з обох боків порівняння. \b у JS не працює з кирилицею,
+// тому розбиваємо на слова за Unicode-класами, а не регулярками з межами слів.
+const TYPE = new Set(['вулиця', 'вулица', 'вул', 'улица', 'ул', 'проспект', 'просп', 'пр', 'провулок', 'пров',
+  'бульвар', 'бул', 'площа', 'пл', 'шосе', 'узвіз', 'набережна', 'наб', 'дорога', 'проїзд', 'тупик', 'алея', 'квартал', 'мікрорайон', 'мкр']);
 export function normStreet(s) {
-  let t = (s || '').toLowerCase().replace(/[’'`ʼ]/g, '').replace(/ґ/g, 'г').replace(/ё/g, 'е').replace(/[.,;]/g, ' ');
-  for (const [re, r] of ABBR) t = t.replace(re, ' ');
-  return t.replace(/\s+/g, ' ').trim();
+  let t = (s || '').toLowerCase().replace(/[’'`ʼ]/g, '').replace(/ґ/g, 'г').replace(/ё/g, 'е');
+  t = t.replace(/пр-?т/g, 'проспект').replace(/б-?р/g, 'бульвар').replace(/м-?н/g, 'мікрорайон');
+  t = t.replace(/[^\p{L}\p{N}]+/gu, ' ');
+  return t.split(' ').filter(w => w && !TYPE.has(w)).join(' ').trim();
 }
 function normNum(n) { return (n || '').toLowerCase().replace(/\s+/g, '').replace(/[’'`ʼ]/g, ''); }
 export function shortStreet(s) {
