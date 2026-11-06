@@ -1,0 +1,109 @@
+// Будинки, адреси та під'їзди з buildings.bin (див. tools/graph_bin.py → write_buildings).
+// Пошук адреси: нормалізація назв вулиць («вул.», «просп.», літера ґ/г, апостроф), пошук за підрядком.
+
+export class Buildings {
+  static fromBinary(buf) {
+    const dv = new DataView(buf); let o = 0;
+    const tag = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)); o = 4;
+    if (tag !== 'NAVB') throw new Error('не buildings.bin');
+    const u32 = () => { const v = dv.getUint32(o, true); o += 4; return v; };
+    const take = (T, count) => { const bytes = count * T.BYTES_PER_ELEMENT; const arr = new T(count); new Uint8Array(arr.buffer).set(new Uint8Array(buf, o, bytes)); o += bytes; return arr; };
+    const json = (len) => { const v = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, o, len))); o += len; return v; };
+    u32(); // version
+    const nB = u32(), nE = u32(); u32(); const streets = json(u32());
+    const b = new Buildings();
+    b.streets = streets;
+    b.x = take(Float32Array, nB); b.y = take(Float32Array, nB); b.street = take(Int32Array, nB);
+    b.num = json(u32());
+    const total = u32(); b.outCount = take(Uint16Array, nB); b.outXY = take(Float32Array, total * 2);
+    b.outOff = new Uint32Array(nB + 1); for (let i = 0; i < nB; i++) b.outOff[i + 1] = b.outOff[i] + b.outCount[i];
+    b.ex = take(Float32Array, nE); b.ey = take(Float32Array, nE); b.eref = json(u32());
+    b._index();
+    return b;
+  }
+
+  _index() {
+    // сітка 250 м для будинків і під'їздів
+    const cell = this.cell = 250;
+    const mk = (xs, ys) => {
+      const m = new Map();
+      for (let i = 0; i < xs.length; i++) { const k = Math.floor(xs[i] / cell) + ',' + Math.floor(ys[i] / cell); let a = m.get(k); if (!a) m.set(k, (a = [])); a.push(i); }
+      return m;
+    };
+    this.gridB = mk(this.x, this.y); this.gridE = mk(this.ex, this.ey);
+    // нормалізовані назви вулиць для пошуку
+    this.streetNorm = this.streets.map(normStreet);
+    // індекс: вулиця → список будинків
+    this.byStreet = new Map();
+    for (let i = 0; i < this.x.length; i++) { const s = this.street[i]; if (s < 0 || !this.num[i]) continue; let a = this.byStreet.get(s); if (!a) this.byStreet.set(s, (a = [])); a.push(i); }
+  }
+
+  get count() { return this.x.length; }
+  get entranceCount() { return this.ex.length; }
+
+  _inBox(grid, xs, ys, x0, y0, x1, y1, limit) {
+    const out = [];
+    const gx0 = Math.floor(x0 / this.cell), gx1 = Math.floor(x1 / this.cell), gy0 = Math.floor(y0 / this.cell), gy1 = Math.floor(y1 / this.cell);
+    if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > 400) return out;
+    for (let gx = gx0; gx <= gx1; gx++) for (let gy = gy0; gy <= gy1; gy++) {
+      const a = grid.get(gx + ',' + gy); if (!a) continue;
+      for (const i of a) { if (xs[i] >= x0 && xs[i] <= x1 && ys[i] >= y0 && ys[i] <= y1) { out.push(i); if (out.length >= limit) return out; } }
+    }
+    return out;
+  }
+  buildingsInBox(x0, y0, x1, y1, limit = 4000) { return this._inBox(this.gridB, this.x, this.y, x0, y0, x1, y1, limit); }
+  entrancesInBox(x0, y0, x1, y1, limit = 1000) { return this._inBox(this.gridE, this.ex, this.ey, x0, y0, x1, y1, limit); }
+
+  outline(i) { return this.outXY.subarray(this.outOff[i] * 2, this.outOff[i + 1] * 2); }
+  label(i) { const s = this.street[i] >= 0 ? this.streets[this.street[i]] : ''; return (s ? shortStreet(s) + ', ' : '') + (this.num[i] || ''); }
+
+  // Найближчий будинок з адресою до точки (м)
+  nearest(p, r = 120) {
+    let best = -1, bd = r;
+    for (const i of this.buildingsInBox(p[0] - r, p[1] - r, p[0] + r, p[1] + r)) {
+      if (!this.num[i]) continue;
+      const d = Math.hypot(this.x[i] - p[0], this.y[i] - p[1]); if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }
+
+  // Пошук «вулиця номер». Повертає до limit результатів {i, text, x, y}; near — для сортування за відстанню
+  search(query, near = null, limit = 12) {
+    const q = normStreet(query);
+    if (q.length < 2) return [];
+    // відокремити номер: останній токен із цифрою
+    const toks = q.split(' ').filter(Boolean);
+    let num = '', streetQ = q;
+    if (toks.length > 1 && /\d/.test(toks[toks.length - 1])) { num = toks.pop(); streetQ = toks.join(' '); }
+    const streetToks = streetQ.split(' ').filter(t => t.length > 1);
+    if (!streetToks.length) return [];
+    const res = [];
+    for (let s = 0; s < this.streets.length; s++) {
+      const n = this.streetNorm[s];
+      if (!streetToks.every(t => n.includes(t))) continue;
+      const houses = this.byStreet.get(s); if (!houses) continue;
+      if (num) {
+        const nn = normNum(num);
+        for (const i of houses) { const hn = normNum(this.num[i]); if (hn === nn) res.push({ i, exact: 2 }); else if (hn.startsWith(nn)) res.push({ i, exact: 1 }); }
+      } else {
+        // без номера — показати вулицю як пункт (перший будинок) + кілька будинків
+        res.push({ i: houses[0], exact: 0, streetOnly: true, s, count: houses.length });
+      }
+      if (res.length > 400) break;
+    }
+    const dist = (r) => near ? Math.hypot(this.x[r.i] - near[0], this.y[r.i] - near[1]) : 0;
+    res.sort((a, b) => (b.exact - a.exact) || (dist(a) - dist(b)));
+    return res.slice(0, limit).map(r => ({ i: r.i, x: this.x[r.i], y: this.y[r.i], streetOnly: !!r.streetOnly, count: r.count, text: r.streetOnly ? shortStreet(this.streets[r.s]) + ` (${r.count} буд.)` : this.label(r.i), d: dist(r) }));
+  }
+}
+
+const ABBR = [[/\bвулиця\b/g, ''], [/\bвул\.?\b/g, ''], [/\bпроспект\b/g, ''], [/\bпросп\.?\b/g, ''], [/\bпр-т\b/g, ''], [/\bпровулок\b/g, ''], [/\bпров\.?\b/g, ''], [/\bбульвар\b/g, ''], [/\bбул\.?\b/g, ''], [/\bплоща\b/g, ''], [/\bпл\.?\b/g, ''], [/\bшосе\b/g, ''], [/\bузвіз\b/g, ''], [/\bнабережна\b/g, ''], [/\bнаб\.?\b/g, ''], [/\bдорога\b/g, ''], [/\bпроїзд\b/g, '']];
+export function normStreet(s) {
+  let t = (s || '').toLowerCase().replace(/[’'`ʼ]/g, '').replace(/ґ/g, 'г').replace(/ё/g, 'е').replace(/[.,;]/g, ' ');
+  for (const [re, r] of ABBR) t = t.replace(re, ' ');
+  return t.replace(/\s+/g, ' ').trim();
+}
+function normNum(n) { return (n || '').toLowerCase().replace(/\s+/g, '').replace(/[’'`ʼ]/g, ''); }
+export function shortStreet(s) {
+  return s.replace(/^вулиця\s+/i, 'вул. ').replace(/^проспект\s+/i, 'просп. ').replace(/^провулок\s+/i, 'пров. ').replace(/^бульвар\s+/i, 'бул. ').replace(/^площа\s+/i, 'пл. ').replace(/^набережна\s+/i, 'наб. ');
+}

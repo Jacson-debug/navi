@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<title>Наві — навігація без GPS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Наві">
+<meta name="theme-color" content="#0b0f14">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<style>
+  :root { --bg:#0b0f14; --panel:rgba(16,22,30,.92); --fg:#e8eef5; --muted:#8a98a8; --ok:#3ddc84; --bad:#ff5a5f; --warn:#ffb020; --accent:#4da3ff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:16px/1.3 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif; overflow:hidden; touch-action:none; }
+  #map { position:fixed; inset:0; display:block; }
+  .top { position:fixed; left:0; right:0; top:0; padding:calc(env(safe-area-inset-top) + 8px) 12px 8px; background:linear-gradient(var(--bg),transparent); pointer-events:none; }
+  .status { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:14px; }
+  .pill { background:var(--panel); border-radius:999px; padding:6px 10px; display:inline-flex; gap:6px; align-items:center; pointer-events:auto; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--muted); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
+  .big { font-size:28px; font-weight:700; letter-spacing:-.5px; }
+  .hint { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 56px); background:var(--panel); border-radius:14px; padding:12px 14px; font-size:15px; display:none; }
+  .hint.show { display:block; }
+  .turn { position:fixed; left:12px; right:12px; top:calc(env(safe-area-inset-top) + 56px); background:var(--panel); border-left:6px solid var(--accent); border-radius:14px; padding:10px 14px; display:none; }
+  .turn.show { display:block; }
+  .turn .d { font-size:30px; font-weight:800; } .turn .t { font-size:17px; color:var(--fg); }
+  .bottom { position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(env(safe-area-inset-bottom) + 10px); display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; background:linear-gradient(transparent,var(--bg)); }
+  .bottom #btnDemo { grid-column: span 2; }
+  button { font:inherit; color:var(--fg); background:var(--panel); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:12px 14px; font-size:15px; flex:1 1 auto; min-width:0; }
+  button.primary { background:var(--accent); color:#06111f; font-weight:700; border-color:transparent; }
+  button.active { outline:2px solid var(--accent); }
+  button:disabled { opacity:.45; }
+  .sheet { position:fixed; left:0; right:0; bottom:0; max-height:70vh; overflow:auto; background:var(--panel); border-radius:18px 18px 0 0; padding:14px 14px calc(env(safe-area-inset-bottom) + 14px); display:none; }
+  .sheet.show { display:block; }
+  .sheet h3 { margin:0 0 10px; font-size:17px; }
+  .row { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,.06); }
+  .row .name { flex:1; }
+  .row small { color:var(--muted); display:block; }
+  .seg { display:inline-flex; border-radius:10px; overflow:hidden; border:1px solid rgba(255,255,255,.1); }
+  .seg button { flex:none; border:0; border-radius:0; padding:8px 10px; font-size:13px; background:transparent; }
+  .seg button.on.ok { background:var(--ok); color:#042; } .seg button.on.bad { background:var(--bad); color:#300; }
+  .close { position:absolute; right:10px; top:8px; background:transparent; border:0; font-size:22px; padding:6px 10px; flex:none; }
+  .toast { position:fixed; left:50%; bottom:120px; transform:translateX(-50%); background:var(--panel); padding:10px 14px; border-radius:12px; font-size:14px; display:none; }
+  .toast.show { display:block; }
+</style>
+</head>
+<body>
+<canvas id="map"></canvas>
+
+<div class="top">
+  <div class="status">
+    <span class="pill"><span id="dotGps" class="dot"></span><span id="txtGps">GPS: —</span></span>
+    <span class="pill"><span id="dotMode" class="dot"></span><span id="txtMode">старт</span></span>
+    <span class="pill"><span class="big" id="speed">0</span>&nbsp;км/год</span>
+    <span class="pill" id="conf">упевненість —</span>
+  </div>
+</div>
+<div class="hint" id="hint"></div>
+<div class="turn" id="turn"><div class="d" id="turnDist"></div><div class="t" id="turnText"></div></div>
+
+<div class="bottom">
+  <button id="btnSensors" class="primary">▶ Датчики</button>
+  <button id="btnHere">📍 Я тут</button>
+  <button id="btnSearch">🔍 Адреса</button>
+  <button id="btnFuel">⛽ АЗС</button>
+  <button id="btnRoute">🧭 До АЗС</button>
+  <button id="btnDemo">🎬 Демо</button>
+  <button id="btnMore" style="flex:0 0 56px">⋯</button>
+</div>
+
+<div class="sheet" id="sheetFuel">
+  <button class="close" data-close="sheetFuel">✕</button>
+  <h3>АЗС поблизу</h3>
+  <div id="fuelList"></div>
+</div>
+
+<div class="sheet" id="sheetSearch">
+  <button class="close" data-close="sheetSearch">✕</button>
+  <h3>Пошук адреси</h3>
+  <input id="addrInput" type="search" placeholder="вул. Хрещатик 22" autocomplete="off" style="width:100%;font:inherit;font-size:17px;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#0b0f14;color:var(--fg);margin-bottom:8px">
+  <div id="addrList"></div>
+</div>
+
+<div class="sheet" id="sheetMore">
+  <button class="close" data-close="sheetMore">✕</button>
+  <h3>Налаштування</h3>
+  <div class="row"><div class="name">Повороти дзеркальні<small>якщо на карті авто повертає не туди</small></div><button id="btnFlip">Перемкнути</button></div>
+  <div class="row"><div class="name">Показувати частинки<small>хмара гіпотез фільтра</small></div><button id="btnParticles">Увімк/вимк</button></div>
+  <div class="row"><div class="name">Карта на північ / за курсом</div><button id="btnRotate">Перемкнути</button></div>
+  <div class="row"><div class="name">Голосові підказки<small id="voiceState"></small></div><button id="btnVoice">Увімк/вимк</button></div>
+  <div class="row"><div class="name">Шар пробок<small>типова швидкість за вашими поїздками о цій годині</small></div><button id="btnTraffic">Увімк/вимк</button></div>
+  <div class="row"><div class="name">Пам'ять пробок<small id="trafficInfo"></small></div><button id="btnTrafficClear">Очистити</button></div>
+  <div class="row"><div class="name">Наїздити історію (демо)<small>25 швидких поїздок по тестовому місту</small></div><button id="btnTrafficDemo">Запустити</button></div>
+  <div class="row"><div class="name">Запис датчиків<small>для налагодження алгоритму на комп'ютері</small></div><button id="btnRec">Старт</button></div>
+  <div class="row"><div class="name">Дані карти</div><div id="dataInfo" style="color:var(--muted);font-size:13px"></div></div>
+  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.4</div></div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
