@@ -105,5 +105,9 @@ export function normStreet(s) {
 }
 function normNum(n) { return (n || '').toLowerCase().replace(/\s+/g, '').replace(/[’'`ʼ]/g, ''); }
 export function shortStreet(s) {
-  return s.replace(/^вулиця\s+/i, 'вул. ').replace(/^проспект\s+/i, 'просп. ').replace(/^провулок\s+/i, 'пров. ').replace(/^бульвар\s+/i, 'бул. ').replace(/^площа\s+/i, 'пл. ').replace(/^набережна\s+/i, 'наб. ');
+  const map = [['вулиця', 'вул.'], ['проспект', 'просп.'], ['провулок', 'пров.'], ['бульвар', 'бул.'], ['площа', 'пл.'], ['набережна', 'наб.']];
+  for (const [full, short] of map) {
+    s = s.replace(new RegExp('^' + full + '\\s+', 'i'), short + ' ').replace(new RegExp('\\s+' + full + '$', 'i'), ' ' + short);
+  }
+  return s;
 }

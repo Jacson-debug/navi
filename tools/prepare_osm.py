@@ -54,6 +54,9 @@ class Collector(osmium.SimpleHandler):
         return ((lon - self.lon0) * D2R * R * math.cos(lat * D2R), (lat - self.lat0) * D2R * R)
 
     def node(self, n):
+        self.n_nodes = getattr(self, 'n_nodes', 0) + 1
+        if self.n_nodes % 5000000 == 0:
+            print(f'  точок прочитано: {self.n_nodes // 1000000} млн, у межах області: будинків {len(self.buildings)}, під\'їздів {len(self.entrances)}', flush=True)
         t = n.tags
         if not n.location.valid() or not self.inside(n.location.lat, n.location.lon):
             return
