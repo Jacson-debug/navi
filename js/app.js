@@ -18,7 +18,7 @@ const S = {
   view: { cx: 0, cy: 0, scale: 1.2 /* px per m */, rotate: false },
   follow: true, showParticles: false,
   routeInfo: null, target: null,
-  hereMode: false, searchTab: 'all',
+  hereMode: false, searchTab: 'all', hintShown: false,
   fuelStatus: JSON.parse(localStorage.getItem('navi.fuelStatus') || '{}'),
   sensorsOn: false, gpsWatch: null, lastDraw: 0, recording: false,
   traffic: null, showTraffic: true, track: null,
@@ -226,6 +226,15 @@ function draw() {
     ctx.strokeStyle = '#0b0f14'; ctx.lineWidth = 1.5 * DPR; ctx.stroke();
     if (v.scale > 1.6) { ctx.fillStyle = col; ctx.font = `${10 * DPR}px sans-serif`; ctx.textBaseline = 'alphabetic'; ctx.fillText(f.brand || f.name || '', p[0], p[1] - r - 4 * DPR); }
     if (isTarget) { ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2 * DPR; ctx.beginPath(); ctx.arc(p[0], p[1], r + 6 * DPR, 0, 7); ctx.stroke(); }
+  }
+  // Приблизне коло від системи, коли точної позиції ще немає
+  const hint0 = S.engine?.state.hint;
+  if (hint0 && !S.engine.state.xy) {
+    const p = worldToScreen(...hint0.xy);
+    const rpx = hint0.acc * v.scale * DPR;
+    ctx.fillStyle = 'rgba(255,176,32,.10)'; ctx.strokeStyle = 'rgba(255,176,32,.55)'; ctx.lineWidth = 2 * DPR;
+    ctx.beginPath(); ctx.arc(p[0], p[1], rpx, 0, 7); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffb020'; ctx.beginPath(); ctx.arc(p[0], p[1], 5 * DPR, 0, 7); ctx.fill();
   }
   // ціль (адреса)
   if (S.target && S.target.kind === 'addr') {
@@ -508,9 +517,11 @@ function findMe(announce = true) {
     S.follow = true;
     if (announce && !answered) {
       answered = true;
-      const a = Math.round(c.accuracy);
-      const r = a < 1000 ? a + ' м' : (a / 1000).toFixed(1) + ' км';
-      toast(a <= 40 ? `Знайшов по супутниках, ±${r}` : `Знайшов по мережі зв'язку, ±${r} — уточню під час руху`);
+      const a = c.accuracy;
+      const r = a < 1000 ? Math.round(a) + ' м' : (a / 1000).toFixed(1) + ' км';
+      if (a <= 40) toast(`Знайшов по супутниках, ±${r}`);
+      else if (a <= 3000) toast(`Знайшов по мережі зв'язку, ±${r} — уточню під час руху`);
+      else toast(`Система дала лише приблизне коло ±${r} — цього замало, щоб визначити вулицю. Увімкніть «Точне місце» в налаштуваннях iOS або вкажіть себе кнопкою «Я тут».`);
     }
     draw();
   };
@@ -711,21 +722,28 @@ function updateStatus() {
   const gpsTxt = {
     none: 'Позиції нема', ok: 'Супутники', weak: 'Wi-Fi / слабкий сигнал',
     net: netAcc ? `Мережа зв'язку ±${netAcc}` : "Мережа зв'язку",
+    coarse: st.hint ? `Лише приблизно ±${(st.hint.acc / 1000).toFixed(1)} км` : 'Лише приблизно',
     rejected: st.spoofByNet ? 'ПІДМІНА (не збігається з мережею)' : 'ПІДМІНА — ігнорую',
     jammed: netAcc ? `GPS глушиться · мережа ±${netAcc}` : 'GPS глушиться',
   }[st.gps] || '—';
   $('txtGps').textContent = gpsTxt;
   $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' ? 'bad' : '');
-  const modeTxt = { init: 'немає позиції', calibrating: 'калібрую осі…', tracking: 'веду без GPS' }[st.mode] || st.mode;
+  const modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду без GPS' }[st.mode] || st.mode;
   $('txtMode').textContent = modeTxt; $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? 'ok' : st.mode === 'calibrating' ? 'warn' : '');
   // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами
-  if (!st.xy) $('conf').textContent = 'позицію не визначено';
+  if (!st.xy) $('conf').textContent = st.hint ? `ви десь у колі ±${(st.hint.acc / 1000).toFixed(1)} км` : 'позицію не визначено';
   else {
     const r = st.spread < 1000 ? Math.round(st.spread) + ' м' : (st.spread / 1000).toFixed(1) + ' км';
     const word = st.spread < 40 && st.confidence > 0.5 ? 'точно' : st.spread < 150 ? 'приблизно' : 'уточнюю';
     $('conf').textContent = `${word} ±${r}`;
   }
   if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; }
+  else if (S.follow && st.hint && !S.hintShown) {
+    // показуємо коло цілком, щоб було видно, про яку частину області йдеться
+    S.hintShown = true;
+    S.view.cx = st.hint.xy[0]; S.view.cy = st.hint.xy[1];
+    S.view.scale = clampScale(Math.min(innerWidth, innerHeight) * 0.42 / st.hint.acc);
+  }
   $('btnCenter').classList.add('show');
   // Діагностика в «⋯»: що саме відповіла система останнього разу
   const gi = $('geoInfo');

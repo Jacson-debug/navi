@@ -17,7 +17,7 @@ export class NavEngine {
     this.stepInterval = opts.stepInterval ?? 0.5; // с між кроками фільтра
     this.pendingDist = 0;
     this.distSinceSnap = 0;
-    this.state = { mode: 'init', xy: null, latlon: null, heading: 0, speed: 0, confidence: 0, spread: 0, gps: 'none', spoof: false, spoofByNet: false, net: null };
+    this.state = { mode: 'init', xy: null, latlon: null, heading: 0, speed: 0, confidence: 0, spread: 0, gps: 'none', spoof: false, spoofByNet: false, net: null, hint: null };
     this.lastGoodGps = null;     // {t, xy} — останній довірений точний фікс
     this.lastNet = null;         // {t, xy, acc} — останній мережевий (вежі/Wi-Fi) фікс
     this.gpsTrust = 0;           // 0..1
@@ -62,20 +62,31 @@ export class NavEngine {
   // iOS не дає застосунку сирі вежі зв'язку й Wi-Fi, але сама визначає по них позицію
   // і повертає її через той самий geolocation — лише з великим радіусом похибки.
   // Тому класифікуємо фікс за точністю, а не за джерелом:
-  //   ≤40 м  — супутники (GNSS): точна прив'язка;
-  //   ≤250 м — змішаний (Wi-Fi поруч): помірна;
-  //   ≤6 км  — мережа (вежі зв'язку): груба, але її РЕБ не глушить;
-  //   більше — ігноруємо.
+  //   ≤40 м   — супутники (GNSS): точна прив'язка;
+  //   ≤250 м  — змішаний (Wi-Fi поруч): помірна;
+  //   ≤3 км   — мережа (вежі зв'язку): груба, але її РЕБ не глушить;
+  //   ≤50 км  — «приблизна геолокація» iOS або одна далека вежа. Прив'язати до
+  //             вулиці неможливо (у колі тисячі доріг), але показати коло варто:
+  //             людина бачить, де вона приблизно, і уточнює кнопкою «Я тут»;
+  //   більше  — ігноруємо.
   pushGps(fix) {
     if (this.recording) this.log.push({ k: 'g', ...fix });
     const xy = this.proj.toXY(fix.lat, fix.lon);
     const acc = fix.accuracy ?? 30;
-    const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'mixed' : acc <= 6000 ? 'net' : 'junk';
+    const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'mixed' : acc <= 3000 ? 'net'
+      : acc <= 50000 ? 'coarse' : 'junk';
     if (kind === 'junk') return;
+
+    if (kind === 'coarse') {
+      this.state.hint = { xy, acc, t: fix.t };
+      if (!this.pf.p.length) { this.state.gps = 'coarse'; this.state.mode = 'hint'; }
+      return;
+    }
 
     // Перший фікс будь-якої якості задає початкове коло пошуку: груба позиція від
     // мережі накриває багато доріг, але фільтр звужує варіанти вже за кілька поворотів.
     if (!this.pf.p.length) {
+      this.state.hint = null;
       this.pf.initAround(xy, Math.max(60, Math.min(acc * 1.5, 3000)));
       this.state.mode = 'tracking';
       this.state.gps = kind === 'gnss' ? 'ok' : kind === 'mixed' ? 'weak' : 'net';
@@ -145,6 +156,7 @@ export class NavEngine {
     this.setPositionXY(xy, r);
   }
   setPositionXY(xy, r = 80) {
+    this.state.hint = null;
     this.pf.initAround(xy, r);
     this.state.mode = 'tracking';
     this._updateEstimate();
