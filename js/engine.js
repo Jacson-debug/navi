@@ -5,6 +5,10 @@ import { MotionProcessor } from './motion.js';
 import { GraphParticleFilter } from './filter.js';
 import { makeProjection, dist } from './geo.js';
 
+// Правдоподібна верхня межа швидкості за класом дороги, м/с
+// (1 — проїзди й двори … 5 — магістралі). З запасом, щоб не різати реальний рух.
+const EDGE_SPEED_CAP = { 1: 11, 2: 19, 3: 22, 4: 26, 5: 36 };
+
 export class NavEngine {
   constructor(graph, opts = {}) {
     this.g = graph;
@@ -26,6 +30,7 @@ export class NavEngine {
     this.gpsLostAfter = opts.gpsLostAfter ?? 8;  // с без GNSS → автономний режим
     // Джерело часу можна підмінити — так симулятор перевіряє ті самі переходи, що й телефон.
     this._now = opts.now ?? (() => Date.now() / 1000);
+    this.gpsSnap = null;     // фікс, прив'язаний до дороги — те, що показуємо в режимі GPS
     this.lastGoodGps = null;     // {t, xy} — останній довірений точний фікс
     this.lastNet = null;         // {t, xy, acc} — останній мережевий (вежі/Wi-Fi) фікс
     this.gpsTrust = 0;           // 0..1
@@ -45,7 +50,14 @@ export class NavEngine {
     if (!r || !r.ready) { this.state.mode = r && !r.ready ? 'calibrating' : this.state.mode; return; }
     this.gyroHeading += r.yawRate * r.dt;
     this.pendingDist += r.speed * r.dt;
-    if (!(this.state.source === 'gps' && this.now() - this.lastGnssWall < 2.5)) this.state.speed = r.speed;
+    if (!(this.state.source === 'gps' && this.now() - this.lastGnssWall < 2.5)) {
+      this.state.speed = r.speed;
+      // Офлайн карта сама обмежує брехню: по дворовому проїзду 120 км/год не буває.
+      if (this.state.source === 'dr' && this.state.edge >= 0) {
+        const cap = EDGE_SPEED_CAP[this.g.level(this.state.edge)] || 30;
+        if (this.motion.speed > cap) { this.motion.speed = cap; this.state.speed = cap; }
+      }
+    }
     if (this.lastStepT === null) { this.lastStepT = sample.t; this.lastStepHeading = this.gyroHeading; }
     if (sample.t - this.lastStepT >= this.stepInterval) {
       const dpsi = this.gyroHeading - this.lastStepHeading;
@@ -168,6 +180,30 @@ export class NavEngine {
         this.pf.reseedAround(xy, Math.max(40, acc * 2), 0.7);
       }
     }
+    // Поки GPS веде — показуємо саме його, прив'язаного до найближчої дороги.
+    // Раніше на екран ішло середнє по хмарі частинок, а воно доганяє фікс кілька
+    // секунд: саме через це рух виглядав із затримкою.
+    if (kind === 'gnss' && acc <= 60) {
+      const hdg = (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 1.5)
+        ? fix.heading * Math.PI / 180 : null;
+      // Ребра напрямлені, і найближче з них може дивитися назад. Якщо знаємо курс —
+      // вибираємо те, що з ним узгоджене, інакше точка «поїде» задом по своїй же вулиці.
+      let best = null;
+      for (const c of this.g.edgesNear(xy, Math.max(35, acc * 1.5))) {
+        let cost = c.d;
+        if (hdg !== null) {
+          let d = c.edge.hdg - hdg;
+          while (d > Math.PI) d -= 2 * Math.PI;
+          while (d <= -Math.PI) d += 2 * Math.PI;
+          cost += Math.abs(d) * 60;
+        }
+        if (!best || cost < best.cost) best = { cost, c };
+      }
+      const m = best && best.c;
+      this.gpsSnap = m
+        ? { xy: m.point.slice(), e: m.edge.id, s: m.s, len: m.edge.len, hdg, acc, t: this.lastFixWall }
+        : { xy: xy.slice(), e: -1, s: 0, len: 0, hdg, acc, t: this.lastFixWall };
+    }
     // Курс від GPS знімає двозначність «туди/назад» по одній вулиці.
     if (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 2.5) {
       this.pf.weightByHeading(fix.heading * Math.PI / 180, 0.5);
@@ -279,6 +315,31 @@ export class NavEngine {
   stopRecording() { this.recording = false; return this.exportLog(); }
   clearRecording() { this._rec = null; this.fixLog = []; if (this.recording) this.startRecording(); }
 
+  // Викликається з циклу малювання. Між фіксами точку треба вести самим, інакше
+  // рух виглядає стрибками: на телефоні фікси приходять раз на секунду, а коли iOS
+  // притримує застосунок — і рідше.
+  tick() {
+    const t = this.now();
+    if (this._lastTick) this._advanceSnap(Math.min(1.5, t - this._lastTick));
+    this._lastTick = t;
+    return this.state;
+  }
+
+  // Просування прив'язки між фіксами: GPS приходить раз на секунду, а точка має
+  // їхати рівно, а не стрибати на 11 метрів.
+  _advanceSnap(dt) {
+    const g = this.gpsSnap;
+    if (!g || g.e < 0 || !(dt > 0) || this.state.source !== 'gps') return;
+    if (this.now() - g.t > 8) return;
+    const ds = this.state.speed * dt;
+    if (!(ds > 0)) return;
+    g.s = Math.min(g.len, g.s + ds);
+    g.xy = this.g.pointOnEdge(g.e, g.s);
+    this.state.xy = g.xy;
+    this.state.latlon = this.proj.toLL(g.xy[0], g.xy[1]);
+    this.state.s = g.s;
+  }
+
   _updateEstimate() {
     const est = this.pf.estimate();
     if (!est) return;
@@ -290,5 +351,17 @@ export class NavEngine {
     this.state.edge = est.edge;
     this.state.s = est.s;
     this.state.mode = (this.motion.ready || this.state.source === 'gps') ? 'tracking' : 'calibrating';
+
+    // У режимі GPS малюємо фікс, а не хмару — хмара лишається напоготові для офлайну.
+    const g = this.gpsSnap;
+    if (g && this.state.source === 'gps' && this.now() - g.t < 8) {
+      this.state.xy = g.xy;
+      this.state.latlon = this.proj.toLL(g.xy[0], g.xy[1]);
+      if (g.hdg !== null) this.state.heading = g.hdg;
+      else if (g.e >= 0) this.state.heading = this.g.hdg[g.e];
+      this.state.spread = Math.max(6, g.acc);
+      this.state.confidence = Math.max(this.state.confidence, 0.9);
+      if (g.e >= 0) { this.state.edge = g.e; this.state.s = g.s; }
+    }
   }
 }

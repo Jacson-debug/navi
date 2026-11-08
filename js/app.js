@@ -511,7 +511,7 @@ async function autoStart() {
   if (!ok) armMotionOnFirstTouch();
 }
 
-function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
+function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; Awake.off(); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
 function onMotion(e) {
   const ag = e.accelerationIncludingGravity, rr = e.rotationRate;
   if (!ag || ag.x == null || !rr || rr.alpha == null) return;
@@ -596,7 +596,58 @@ function locateByNetwork(initial) {
 }
 
 let wakeLock = null;
-async function requestWakeLock() { try { if ('wakeLock' in navigator) { wakeLock = await navigator.wakeLock.request('screen'); document.addEventListener('visibilitychange', async () => { if (document.visibilityState === 'visible' && S.sensorsOn) wakeLock = await navigator.wakeLock.request('screen'); }); } } catch { } }
+// ---------- екран не має гаснути ----------
+// Раніше wake lock просився один раз, і якщо не вдалося (а на старті сторінка ще
+// може бути не «видимою»), повторних спроб не було — екран гас посеред поїздки.
+// Тому: повторні спроби, перезапит після згортання, і резервний шлях для iOS —
+// беззвучне відео в циклі, яке Safari вважає приводом не гасити екран.
+const KEEP_VIDEO = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAM2bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAmB0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAHYbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAKABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABg21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAUNzdGJsAAAAt3N0c2QAAAAAAAAAAQAAAKdhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABFUxhdmM2MC4zMS4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBQsAe/+EAFmdCwB7aEJsBEAAAAwAQAAADAKDxYuoBAARozg/IAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAAFcgAABXIAAAAGHN0dHMAAAAAAAAAAQAAAAUAAAgAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAUAAAABAAAAKHN0c3oAAAAAAAAAAAAAAAUAAAKRAAAACgAAAAoAAAAKAAAACgAAABRzdGNvAAAAAAAAAAEAAANmAAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2MC4xNi4xMDAAAAAIZnJlZQAAAsFtZGF0AAACbwYF//9r3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDExMSBtZT1oZXggc3VibWU9MiBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MiBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj01IHNjZW5lY3V0PTQwIGludHJhX3JlZnJlc2g9MCByY19sb29rYWhlYWQ9MTAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAAAGmWIhAR///8PRQABKr8nJyddddddddddddeAAAAABkGaIBHwjAAAAAZBmkAR8IwAAAAGQZpgEPCMAAAABkGagD/CMA==';
+const Awake = {
+  lock: null, video: null, mode: 'off', timer: null,
+  async on() {
+    if (!this.timer) this.timer = setInterval(() => { if (S.sensorsOn && document.visibilityState === 'visible') this._ensure(); }, 15000);
+    if (!this._vis) {
+      this._vis = true;
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && S.sensorsOn) this._ensure();
+      });
+    }
+    await this._ensure();
+    return this.mode;
+  },
+  async _ensure() {
+    if (this.lock && !this.lock.released) return;
+    if ('wakeLock' in navigator) {
+      try {
+        this.lock = await navigator.wakeLock.request('screen');
+        this.lock.addEventListener('release', () => { this.lock = null; });
+        this.mode = 'lock';
+        this._videoOff();
+        return;
+      } catch (e) { this.lock = null; }
+    }
+    this._videoOn();
+  },
+  _videoOn() {
+    if (!this.video) {
+      const v = document.createElement('video');
+      v.setAttribute('playsinline', ''); v.setAttribute('muted', ''); v.setAttribute('loop', '');
+      v.muted = true; v.loop = true; v.playsInline = true; v.src = KEEP_VIDEO;
+      v.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0.01;pointer-events:none';
+      document.body.appendChild(v);
+      this.video = v;
+    }
+    this.video.play().then(() => { this.mode = 'video'; }).catch(() => {
+      this.mode = 'off';
+      // play() без дотику Safari може заблокувати — пробуємо на першому ж доторку
+      const go = () => { removeEventListener('pointerdown', go, true); this.video.play().then(() => { this.mode = 'video'; }).catch(() => {}); };
+      addEventListener('pointerdown', go, true);
+    });
+  },
+  _videoOff() { if (this.video) { this.video.pause(); } },
+  off() { try { this.lock?.release(); } catch (e) {} this.lock = null; this._videoOff(); this.mode = 'off'; clearInterval(this.timer); this.timer = null; }
+};
+async function requestWakeLock() { return Awake.on(); }
 
 // ---------- демо ----------
 // ---------- інтерфейс ----------
@@ -750,6 +801,11 @@ function startAutoRec() {
   updateRecInfo();
 }
 
+function updateScreenInfo() {
+  const el = $('screenInfo'); if (!el) return;
+  el.textContent = { lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: 'не вдалося втримати — екран може гаснути' }[Awake.mode] || '—';
+}
+
 function updateRecInfo() {
   const el = $('recInfo'); if (!el) return;
   const b = $('btnAutoRec');
@@ -758,7 +814,7 @@ function updateRecInfo() {
   const n = S.engine ? S.engine.recordedSamples : 0;
   el.textContent = n ? `записано ${Math.round(n / 50 / 60)} хв (${n.toLocaleString('uk')} семплів)` : 'увімкнено, чекаю на датчики руху';
 }
-setInterval(updateRecInfo, 5000);
+setInterval(() => { updateRecInfo(); updateScreenInfo(); }, 5000);
 
 $('btnAutoRec').addEventListener('click', () => {
   const on = !autoRecOn();
@@ -805,8 +861,11 @@ function updateWhere() {
 
 function updateStatus() {
   const eng = S.engine; if (!eng) return;
-  const st = eng.state;
-  $('speed').textContent = Math.round(st.speed * 3.6);
+  const st = eng.tick();
+  // Без GPS швидкість — оцінка з датчиків і карти, а не вимір. Показуємо її з «≈»,
+  // щоб число не читалося як точне: акселерометр принципово не бачить сталої швидкості.
+  const kmh = Math.round(st.speed * 3.6);
+  $('speed').textContent = (st.source === 'gps' || !S.sensorsOn) ? String(kmh) : '≈' + kmh;
   if (S.sensorsOn) eng.updateSource();
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
   const gpsTxt = {
@@ -887,7 +946,7 @@ function loop(now) {
   setInterval(() => { try { localStorage.setItem('navi.view', JSON.stringify({ cx: S.view.cx, cy: S.view.cy, scale: S.view.scale })); } catch { } }, 5000);
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
-  updateRecInfo();
+  updateRecInfo(); updateScreenInfo();
   // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
   if (real) autoStart();
   const seen = localStorage.getItem('navi.seen');
