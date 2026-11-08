@@ -20,7 +20,8 @@ function runTrip(k, scenario) {
     try { sim = simulateDrive(graph, from, to, { seed: 1000 + k, ios: scenario.ios, R: rotationMatrix(rng() * 6.28, 0.6 + rng() * 0.9, (rng() - 0.5) * 0.6), cruise: 10 + rng() * 6 }); break; } catch { }
   }
   if (!sim) return null;
-  const eng = new NavEngine(graph, { motion: { gravitySign: scenario.ios ? -1 : 1 }, filter: { rng: mulberry32(5 + k) } });
+  let simT = 0;
+  const eng = new NavEngine(graph, { motion: { gravitySign: scenario.ios ? -1 : 1 }, filter: { rng: mulberry32(5 + k) }, now: () => simT });
   const gpsUntil = scenario.gpsSeconds;             // GPS працює перші N секунд, далі РЕБ
   const proj = eng.proj;
   const errs = [], errsAll = []; let onEdge = 0, cnt = 0, firstEst = null;
@@ -28,11 +29,13 @@ function runTrip(k, scenario) {
   let lastGps = -10;
   for (let i = 0; i < sim.samples.length; i++) {
     const smp = sim.samples[i], tr = sim.truth[i];
+    simT = smp.t;
     eng.pushMotion(smp);
+    eng.updateSource();
     if (smp.t < gpsUntil && smp.t - lastGps >= 1) {
       lastGps = smp.t;
       const [lat, lon] = proj.toLL(tr.x + 6 * (rng() - 0.5) * 2, tr.y + 6 * (rng() - 0.5) * 2);
-      eng.pushGps({ t: smp.t, lat, lon, accuracy: 8, speed: tr.v });
+      eng.pushGps({ t: smp.t, lat, lon, accuracy: 8, speed: tr.v, heading: tr.hdg != null ? (tr.hdg * 180 / Math.PI + 360) % 360 : null });
     } else if (scenario.netOnly && smp.t - lastGps >= 25) {
       // РЕБ глушить супутники, але вежі зв'язку працюють: груба позиція раз на 25 с
       lastGps = smp.t;

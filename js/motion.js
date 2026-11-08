@@ -23,7 +23,7 @@ export class MotionProcessor {
     // gravitySign: -1, якщо датчик показує вектор уздовж гравітації (iOS Safari),
     //              +1, якщо проти неї (специфікація W3C, Android Chrome).
     this.gravitySign = opts.gravitySign ?? -1;
-    this.maxSpeed = opts.maxSpeed ?? 45;      // м/с
+    this.maxSpeed = opts.maxSpeed ?? 36;      // м/с (~130 км/год)
     this.accelScale = opts.accelScale ?? 1.0; // калібрування масштабу (вчиться з GPS)
     this.reset();
   }
@@ -44,6 +44,16 @@ export class MotionProcessor {
     this._win = [];
     this._innovVec = [0, 0, 0]; this._innovSlow = [0, 0, 0];
     this._aLatF = 0; this._yawF = 0;
+    this.gpsMoveUntil = 0;   // GPS щойно бачив рух — не вірити детектору зупинки
+    this._aFwdPrev = 0;
+    this._brakeT = -1e9;     // коли останнє відчутне гальмування
+    this._everMoved = false; // інтегратор бачив справжній рух після останньої зупинки
+    this._quietT = 0;        // як довго тримається «тиша»
+    this._lvl = 0;           // поточний рівень вібрації (середнє |лінійного прискорення|)
+    // Рівень вібрації різний у кожному авто й тримачі, тож поріг зупинки не можна
+    // зашити числом — вчимо його з GPS: як трясе на стоянці і як трясе в руху.
+    this.lvlParked = null;
+    this.lvlMoving = null;
     this.turnSpeedEst = null;
     this.distance = 0;
   }
@@ -88,7 +98,28 @@ export class MotionProcessor {
     const meanA = this._win.reduce((p, c) => p + c.a, 0) / n;
     const varA = this._win.reduce((p, c) => p + (c.a - meanA) ** 2, 0) / n;
     const meanW = this._win.reduce((p, c) => p + c.w, 0) / n;
-    const stationaryNow = n >= 5 && varA < 0.05 && meanW < 0.03;
+    // Детектор зупинки спирається на вібрацію, а вона залежить від авто й кріплення:
+    // на рівній дорозі з жорстким тримачем рівний хід схожий на стоянку, і швидкість
+    // помилково обнулялася. Тому GPS, якщо він щойно бачив рух, має право вето.
+    const gpsSaysMoving = this.gpsMoveUntil > 0 && this.t < this.gpsMoveUntil;
+    // І головне: щоб стояти, треба було спершу загальмувати. Гальмування — це
+    // великий і добре помітний сигнал (−1..−3 м/с²), а рівний хід на гладкому
+    // асфальті його не має. Без цієї умови детектор «паркував» авто на ходу.
+    // Для акселерометра рівний хід і стоянка однакові — прискорення нуль і там, і там.
+    // Відрізняє їх лише трясіння дороги, і саме його РІВЕНЬ, а не розкид: раніше тут
+    // стояла дисперсія, яка майже однакова і на стоянці, і на ходу, тому детектор
+    // «парковав» авто на рівному ходу й обнуляв швидкість.
+    this._lvl = meanA;
+    let vibQuiet;
+    if (this.lvlParked !== null && this.lvlMoving !== null && this.lvlMoving > this.lvlParked * 2) {
+      vibQuiet = meanA < this.lvlParked + 0.35 * (this.lvlMoving - this.lvlParked);
+    } else {
+      vibQuiet = meanA < 0.12 && varA < 0.05;
+    }
+    const quiet = n >= 5 && vibQuiet && meanW < 0.05;
+    this._quietT = quiet ? this._quietT + dt : 0;
+    // Зупинка мусить тривати: короткі «тихі» секунди на рівному ходу її не оголошують.
+    const stationaryNow = quiet && !gpsSaysMoving;
     this.stillTime = stationaryNow ? this.stillTime + dt : 0;
     this.stationary = this.stillTime > 1.5;
 
@@ -99,6 +130,7 @@ export class MotionProcessor {
       if (this.fwd) this.accBiasFwd = this.accBiasFwd * (1 - k) + v3.dot(linH, this.fwd) * k;
       this.speed = 0;
       this.turnSpeedEst = null;
+      this._everMoved = false;
     }
 
     // --- швидкість обертання навколо вертикалі (+ = проти годинникової = ліворуч) ---
@@ -125,9 +157,17 @@ export class MotionProcessor {
     const rawAFwd = v3.dot(linH, this.fwd);
     // На рівному ході середнє поздовжнє прискорення за десятки секунд ≈ 0 (швидкість не росте нескінченно),
     // тож повільно вчимо залишковий зсув (сенсор + «витік» гравітації через похибку вертикалі).
-    if (!this.stationary && !accelerating && this.speed > 3) this.accBiasFwd = lp(this.accBiasFwd, rawAFwd, dt, 25);
-    const aFwd = (rawAFwd - this.accBiasFwd) * this.accelScale;
+    // Умова «!accelerating» у місті майже не виконується (світлофори, перебудування),
+    // тому зсув не вчився і швидкість тікала вгору до стелі. За хвилину руху середнє
+    // поздовжнє прискорення все одно ≈ 0, тож вчимо завжди в руху, але повільно.
+    // На рівному ходу справжнє середнє прискорення = 0, тож усе, що бачимо, — це зсув
+    // (сенсор + «витік» гравітації після розгону). Тому в сталому режимі вчимо швидко:
+    // інакше цей залишок інтегрується і швидкість поволі з'їдається до нуля.
+    if (!this.stationary && this.speed > 2) this.accBiasFwd = lp(this.accBiasFwd, rawAFwd, dt, accelerating ? 150 : 4);
+    let aFwd = (rawAFwd - this.accBiasFwd) * this.accelScale;
+    if (!accelerating && Math.abs(aFwd) < 0.06) aFwd = 0;   // мертва зона проти повзучого дрейфу
     const aLat = v3.dot(linH, right);          // + = вправо
+    this._aFwdPrev = aFwd;
 
     // --- швидкість ---
     if (!this.stationary) {
@@ -146,6 +186,33 @@ export class MotionProcessor {
     }
     this.distance += this.speed * dt;
     return { dt, speed: this.speed, yawRate: this.yawRate, stationary: this.stationary, ready: true, aFwd, aLat };
+  }
+
+  // Жорстко задати швидкість (надійний GPS). Інтегратор повністю переставляється,
+  // інакше накопичена похибка лишається і повзе далі.
+  setSpeed(v) {
+    if (!(v >= 0)) return;
+    if (v > 2) { this.gpsMoveUntil = (this.t ?? 0) + 6; this.stillTime = 0; this.stationary = false; }
+    else if (v < 0.5) { this.gpsMoveUntil = 0; }
+    // вчимо рівень вібрації для свого авто й тримача
+    const k = 0.06;
+    if (v < 0.5) this.lvlParked = this.lvlParked === null ? this._lvl : this.lvlParked * (1 - k) + this._lvl * k;
+    else if (v > 5) this.lvlMoving = this.lvlMoving === null ? this._lvl : this.lvlMoving * (1 - k) + this._lvl * k;
+    if (this.speed > 1 && v > 1) {
+      const ratio = v / this.speed;
+      if (ratio > 0.4 && ratio < 2.5) {
+        this.accelScale = Math.max(0.5, Math.min(1.8, this.accelScale * (0.97 + 0.03 * ratio)));
+      }
+    }
+    this.speed = Math.min(this.maxSpeed, v);
+    this.turnSpeedEst = null;
+  }
+
+  // GPS зник (РЕБ): авто майже напевно продовжує рух із тією ж швидкістю.
+  // Зупинити точку на карті — гірша з можливих відповідей, тому «котимося» далі.
+  coastFrom(v) {
+    if (v > 1 && this.speed < v * 0.5) this.speed = v;
+    this.gpsMoveUntil = 0;
   }
 
   // Калібрування масштабу прискорення за надійним GPS

@@ -485,7 +485,7 @@ function startGps() {
   S.gpsWatch = navigator.geolocation.watchPosition((pos) => {
     const c = pos.coords;
     S.lastFixAt = Date.now();
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed });
+    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading });
   }, (err) => {
     S.lastGeoErr = geoErrText(err);
     if (err.code === 1) { $('txtGps').textContent = 'Геолокація заборонена'; $('dotGps').className = 'dot bad'; }
@@ -513,7 +513,7 @@ function findMe(announce = true) {
   const ok = (pos) => {
     const c = pos.coords;
     S.lastNetAt = Date.now(); S.lastGeoErr = '';
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed });
+    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading });
     S.follow = true;
     if (announce && !answered) {
       answered = true;
@@ -539,7 +539,7 @@ function locateByNetwork(initial) {
     S.netPending = false;
     const c = pos.coords;
     S.lastNetAt = Date.now();
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: null });
+    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: null, heading: null });
     if (initial) {
       const a = Math.round(c.accuracy);
       toast(a <= 40 ? 'Позицію визначено по супутниках' : `Позицію визначено по мережі зв'язку, ±${a < 1000 ? a + ' м' : (a / 1000).toFixed(1) + ' км'} — уточню під час руху`);
@@ -641,7 +641,18 @@ function renderSearch() {
 $('btnMore').addEventListener('click', () => $('sheetMore').classList.add('show'));
 $('btnFlip').addEventListener('click', () => { S.engine.flipTurns(); toast('Знак поворотів перемкнено'); });
 $('btnParticles').addEventListener('click', () => { S.showParticles = !S.showParticles; toast(S.showParticles ? 'Гіпотези показано' : 'Гіпотези сховано'); draw(); });
-$('btnRotate').addEventListener('click', () => { S.view.rotate = !S.view.rotate; toast(S.view.rotate ? 'Карта за курсом' : 'Карта на північ'); draw(); });
+function setOrient(rotate, say = true) {
+  S.view.rotate = rotate;
+  const b = $('btnOrient');
+  if (b) { b.textContent = rotate ? '⬆︎ Курс' : '⬆︎ Пн'; b.classList.toggle('on', rotate); }
+  const r = $('btnRotate'); if (r) r.textContent = rotate ? 'Карта за курсом' : 'Карта на північ';
+  if (say) toast(rotate ? 'Карта крутиться за курсом' : 'Карта зафіксована на північ');
+  try { localStorage.setItem('navi.rotate', rotate ? '1' : '0'); } catch (e) {}
+  draw();
+}
+$('btnRotate').addEventListener('click', () => setOrient(!S.view.rotate));
+$('btnOrient').addEventListener('click', () => setOrient(!S.view.rotate));
+try { setOrient(localStorage.getItem('navi.rotate') === '1', false); } catch (e) { setOrient(false, false); }
 $('btnSearch').addEventListener('click', openSearch);
 $('btnCenter').addEventListener('click', () => {
   const st = S.engine?.state;
@@ -717,7 +728,7 @@ function updateStatus() {
   const eng = S.engine; if (!eng) return;
   const st = eng.state;
   $('speed').textContent = Math.round(st.speed * 3.6);
-  if (S.sensorsOn) eng.noteGpsSilence(eng.lastStepT ?? 0);
+  if (S.sensorsOn) eng.updateSource();
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
   const gpsTxt = {
     none: 'Позиції нема', ok: 'Супутники', weak: 'Wi-Fi / слабкий сигнал',
@@ -728,8 +739,10 @@ function updateStatus() {
   }[st.gps] || '—';
   $('txtGps').textContent = gpsTxt;
   $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' ? 'bad' : '');
-  const modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду без GPS' }[st.mode] || st.mode;
-  $('txtMode').textContent = modeTxt; $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? 'ok' : st.mode === 'calibrating' ? 'warn' : '');
+  let modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду' }[st.mode] || st.mode;
+  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : 'офлайн: датчики + карта';
+  $('txtMode').textContent = modeTxt;
+  $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? (st.source === 'gps' ? 'ok' : 'warn') : st.mode === 'calibrating' ? 'warn' : '');
   // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами
   if (!st.xy) $('conf').textContent = st.hint ? `ви десь у колі ±${(st.hint.acc / 1000).toFixed(1)} км` : 'позицію не визначено';
   else {
@@ -745,6 +758,7 @@ function updateStatus() {
     S.view.scale = clampScale(Math.min(innerWidth, innerHeight) * 0.42 / st.hint.acc);
   }
   $('btnCenter').classList.add('show');
+  $('btnCenter').classList.toggle('on', !!S.follow);
   // Діагностика в «⋯»: що саме відповіла система останнього разу
   const gi = $('geoInfo');
   if (gi) {

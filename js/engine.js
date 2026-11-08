@@ -17,7 +17,15 @@ export class NavEngine {
     this.stepInterval = opts.stepInterval ?? 0.5; // с між кроками фільтра
     this.pendingDist = 0;
     this.distSinceSnap = 0;
-    this.state = { mode: 'init', xy: null, latlon: null, heading: 0, speed: 0, confidence: 0, spread: 0, gps: 'none', spoof: false, spoofByNet: false, net: null, hint: null };
+    this.state = { mode: 'init', xy: null, latlon: null, heading: 0, speed: 0, confidence: 0, spread: 0, gps: 'none', spoof: false, spoofByNet: false, net: null, hint: null, source: 'none' };
+    // Час у секундах стінного годинника — ОДНА шкала для всіх джерел.
+    // (Раніше фікси мали epoch, а датчики — час від старту сторінки, тож
+    //  порівняння «чи давно був GPS» ніколи не спрацьовувало.)
+    this.lastFixWall = 0;        // будь-який прийнятий фікс
+    this.lastGnssWall = 0;       // саме супутниковий
+    this.gpsLostAfter = opts.gpsLostAfter ?? 8;  // с без GNSS → автономний режим
+    // Джерело часу можна підмінити — так симулятор перевіряє ті самі переходи, що й телефон.
+    this._now = opts.now ?? (() => Date.now() / 1000);
     this.lastGoodGps = null;     // {t, xy} — останній довірений точний фікс
     this.lastNet = null;         // {t, xy, acc} — останній мережевий (вежі/Wi-Fi) фікс
     this.gpsTrust = 0;           // 0..1
@@ -32,7 +40,7 @@ export class NavEngine {
     if (!r || !r.ready) { this.state.mode = r && !r.ready ? 'calibrating' : this.state.mode; return; }
     this.gyroHeading += r.yawRate * r.dt;
     this.pendingDist += r.speed * r.dt;
-    this.state.speed = r.speed;
+    if (!(this.state.source === 'gps' && this.now() - this.lastGnssWall < 2.5)) this.state.speed = r.speed;
     if (this.lastStepT === null) { this.lastStepT = sample.t; this.lastStepHeading = this.gyroHeading; }
     if (sample.t - this.lastStepT >= this.stepInterval) {
       const dpsi = this.gyroHeading - this.lastStepHeading;
@@ -101,6 +109,7 @@ export class NavEngine {
       // коли власна оцінка вийшла за коло похибки, тобто суперечить мережі.
       this.lastNet = { t: fix.t, xy, acc };
       this.state.net = { xy, acc, t: fix.t };
+      this.lastFixWall = this.now();
       if (this.state.gps !== 'ok' && this.state.gps !== 'weak') this.state.gps = 'net';
       if (this.state.xy) {
         const off = dist(this.state.xy, xy);
@@ -136,19 +145,75 @@ export class NavEngine {
       this.state.spoof = true; this.state.gps = 'rejected';
       return;
     }
+    const prevGood = this.lastGoodGps;
     this.gpsTrust = Math.min(1, this.gpsTrust + 0.25);
     this.state.spoof = false; this.state.spoofByNet = false;
     this.state.gps = kind === 'gnss' ? 'ok' : 'weak';
     this.lastGoodGps = { t: fix.t, xy };
-    if (this.gpsTrust >= 0.5) this.pf.weightByPosition(xy, Math.max(15, acc));
-    if (kind === 'gnss' && fix.speed != null && fix.speed >= 0) this.motion.calibrateWithSpeed(fix.speed);
+    this.lastFixWall = this.now();
+    if (kind === 'gnss') { this.lastGnssWall = this.lastFixWall; this.state.source = 'gps'; }
+
+    // Поки GPS живий — він веде. Тягнемо хмару частинок щільно до фікса,
+    // щоб позиція була саме GPS-ом, прив'язаним до дороги, а не компромісом із датчиками.
+    if (this.gpsTrust >= 0.5) {
+      const sigma = kind === 'gnss' ? Math.max(12, acc * 0.6) : Math.max(25, acc);
+      this.pf.weightByPosition(xy, sigma);
+      if (kind === 'gnss' && acc <= 25 && dist(xy, this.state.xy || xy) > Math.max(60, acc * 3)) {
+        // далеко відійшли від GPS — пересіваємо, а не повземо до нього хвилину
+        this.pf.reseedAround(xy, Math.max(40, acc * 2), 0.7);
+      }
+    }
+    // Курс від GPS знімає двозначність «туди/назад» по одній вулиці.
+    if (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 2.5) {
+      this.pf.weightByHeading(fix.heading * Math.PI / 180, 0.5);
+    }
+    // Швидкість: беремо GPS-ову напряму. Інтегрування прискорення — лише
+    // підміна на час, коли GPS немає; тримати його як основне джерело не можна.
+    let vGps = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed)) ? fix.speed : null;
+    // Не кожен пристрій дає coords.speed. Тоді беремо її з відстані між фіксами —
+    // інакше на екрані 0 км/год, хоча точка впевнено їде.
+    if (vGps === null && prevGood) {
+      const dtf = fix.t - prevGood.t;
+      if (dtf > 0.3 && dtf < 10) {
+        const v = dist(xy, prevGood.xy) / dtf;
+        if (v < 70) vGps = v;
+      }
+    }
+    if (vGps !== null) {
+      this.motion.setSpeed(vGps);
+      this.state.speed = vGps;
+    }
     this._updateEstimate();
   }
 
-  // Давно не було жодного точного фікса — позначаємо, що ведемо автономно
-  noteGpsSilence(now) {
-    if (this.lastGoodGps && now - this.lastGoodGps.t > 12 && this.state.gps === 'ok') this.state.gps = 'jammed';
+  now() { return this._now(); }
+
+  // Хто веде зараз. Поки є свіжий супутниковий фікс — GPS. Зник або підміняють —
+  // переходимо на датчики + карту. Викликається з таймера UI кілька разів на секунду.
+  updateSource() {
+    const age = this.now() - this.lastGnssWall;
+    const hadGnss = this.lastGnssWall > 0;
+    if (this.state.spoof || this.state.spoofByNet) {
+      if (this.state.source === 'gps') this.motion.coastFrom(this.state.speed);
+      this.state.source = 'dr';
+      this.state.gps = 'rejected';
+      return 'dr';
+    }
+    if (hadGnss && age <= this.gpsLostAfter) {
+      this.state.source = 'gps';
+      if (this.state.gps === 'jammed') this.state.gps = 'ok';
+    } else {
+      const was = this.state.source;
+      this.state.source = this.pf.p.length ? 'dr' : 'none';
+      if (hadGnss && this.state.gps === 'ok') this.state.gps = 'jammed';
+      // Щойно втратили GPS: авто майже напевно їде далі з тією ж швидкістю.
+      if (was === 'gps' && this.state.source === 'dr') this.motion.coastFrom(this.state.speed);
+    }
+    return this.state.source;
   }
+
+  // Сумісність зі старим викликом
+  noteGpsSilence() { return this.updateSource(); }
 
   // ---------- ручні корекції ----------
   setPositionLatLon(lat, lon, r = 80) {
@@ -179,6 +244,6 @@ export class NavEngine {
     this.state.spread = est.spread;
     this.state.edge = est.edge;
     this.state.s = est.s;
-    this.state.mode = this.motion.ready ? 'tracking' : 'calibrating';
+    this.state.mode = (this.motion.ready || this.state.source === 'gps') ? 'tracking' : 'calibrating';
   }
 }

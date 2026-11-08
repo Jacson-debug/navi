@@ -202,6 +202,19 @@ export class GraphParticleFilter {
     this._resample();
   }
 
+  // Курс від GPS (рад, 0 = північ, за годинниковою). Ребра напрямлені, тож це
+  // прибирає головну двозначність карти — рух «туди» чи «назад» по одній вулиці.
+  weightByHeading(hdg, sigma = 0.6) {
+    for (const q of this.p) {
+      let d = this.g.hdg[q.e] - hdg;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d <= -Math.PI) d += 2 * Math.PI;
+      q.w *= Math.exp(-(d * d) / (2 * sigma * sigma)) + 1e-3;
+    }
+    this._normalize();
+    this._resample();
+  }
+
   _normalize() {
     let s = 0; for (const q of this.p) s += q.w;
     if (s <= 0 || !isFinite(s)) { for (const q of this.p) q.w = 1 / this.p.length; return; }
