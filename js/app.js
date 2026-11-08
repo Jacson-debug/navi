@@ -441,33 +441,77 @@ function updateTurn() {
 }
 
 // ---------- датчики та GPS ----------
+const motionNeedsPermission = () => typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function';
+
+// Дозвіл на датчики руху iOS дає лише у відповідь на дотик, тому це окремо від решти.
+async function enableMotion(opts = {}) {
+  if (S.motionOn) return true;
+  let motion = true;
+  try {
+    if (motionNeedsPermission()) {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== 'granted') { motion = false; if (!opts.quiet) toast('Без дозволу на рух вестиму лише по мережі — точність буде гіршою'); }
+    }
+  } catch (e) { motion = false; if (!opts.quiet) toast('Датчики руху недоступні: ' + e.message); }
+  if (!('DeviceMotionEvent' in window)) { motion = false; if (!opts.quiet) toast('Цей браузер не дає датчиків руху — лише груба позиція по мережі'); }
+
+  if (motion) {
+    S.t0 = null;
+    addEventListener('devicemotion', onMotion);
+    try { localStorage.setItem('navi.motionGranted', '1'); } catch (e) {}
+    if (!opts.quiet) {
+      hint('Закріпіть телефон у тримачі. Перші секунди стійте на місці, потім рушайте — застосунок сам визначить, де «вперед».');
+      setTimeout(() => hint(''), 9000);
+    }
+    if (autoRecOn()) startAutoRec();
+  }
+  S.motionOn = motion;
+  return motion;
+}
+
+// Якщо дозвіл просити рано (немає дотику) — вмикаємо датчики на першому ж доторку
+// до екрана, щоб не треба було шукати кнопку перед виїздом.
+let motionArmed = false;
+function armMotionOnFirstTouch() {
+  if (motionArmed || S.motionOn) return;
+  motionArmed = true;
+  const go = () => {
+    removeEventListener('pointerdown', go, true);
+    removeEventListener('touchstart', go, true);
+    enableMotion({ quiet: true });
+  };
+  addEventListener('pointerdown', go, true);
+  addEventListener('touchstart', go, true);
+}
+
+function markRunning(on) {
+  $('btnSensors').textContent = on ? '⏹ Стоп' : '▶ Старт';
+  $('btnSensors').classList.toggle('primary', !on);
+}
+
 async function startSensors() {
   if (S.sensorsOn) { stopSensors(); return; }
   // Позицію вмикаємо завжди й першою: навіть якщо датчики руху заборонені або їх немає,
   // мережа зв'язку дасть хоча б грубе місцезнаходження.
   S.sensorsOn = true;
-  $('btnSensors').textContent = '⏹ Стоп'; $('btnSensors').classList.remove('primary');
+  markRunning(true);
   startGps(); requestWakeLock();
-
-  let motion = true;
-  try {
-    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
-      const r = await DeviceMotionEvent.requestPermission();
-      if (r !== 'granted') { motion = false; toast('Без дозволу на рух вестиму лише по мережі — точність буде гіршою'); }
-    }
-  } catch (e) { motion = false; toast('Датчики руху недоступні: ' + e.message); }
-  if (!('DeviceMotionEvent' in window)) { motion = false; toast('Цей браузер не дає датчиків руху — лише груба позиція по мережі'); }
-
-  if (motion) {
-    S.t0 = null;
-    addEventListener('devicemotion', onMotion);
-    hint('Закріпіть телефон у тримачі. Перші секунди стійте на місці, потім рушайте — застосунок сам визначить, де «вперед».');
-    setTimeout(() => hint(''), 9000);
-  }
-  S.motionOn = motion;
+  await enableMotion();
 }
 
-function stopSensors() { removeEventListener('devicemotion', onMotion); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; $('btnSensors').textContent = '▶ Старт'; $('btnSensors').classList.add('primary'); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
+// Вмикається саме́ при відкритті: позиція — відразу, датчики руху — якщо дозвіл уже
+// давали раніше, інакше на першому доторку до екрана.
+async function autoStart() {
+  S.sensorsOn = true;
+  markRunning(true);
+  startGps(); requestWakeLock();
+  const granted = (() => { try { return localStorage.getItem('navi.motionGranted') === '1'; } catch (e) { return false; } })();
+  let ok = false;
+  if (granted || !motionNeedsPermission()) ok = await enableMotion({ quiet: true });
+  if (!ok) armMotionOnFirstTouch();
+}
+
+function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
 function onMotion(e) {
   const ag = e.accelerationIncludingGravity, rr = e.rotationRate;
   if (!ag || ag.x == null || !rr || rr.alpha == null) return;
@@ -696,9 +740,44 @@ function updateTrafficInfo() {
 $('btnTraffic').addEventListener('click', () => { S.showTraffic = !S.showTraffic; toast(S.showTraffic ? 'Шар пробок увімкнено' : 'Шар пробок вимкнено'); draw(); });
 $('btnTrafficClear').addEventListener('click', () => { S.traffic.clear(); updateTrafficInfo(); draw(); toast('Пам\'ять пробок очищено'); });
 setInterval(updateTrafficInfo, 10000);
+// --- автозапис поїздок ---
+const autoRecOn = () => { try { return localStorage.getItem('navi.autorec') !== '0'; } catch (e) { return true; } };
+
+function startAutoRec() {
+  if (S.recording || !S.engine) return;
+  S.engine.startRecording();
+  S.recording = true;
+  updateRecInfo();
+}
+
+function updateRecInfo() {
+  const el = $('recInfo'); if (!el) return;
+  const b = $('btnAutoRec');
+  if (!autoRecOn()) { el.textContent = 'вимкнено'; if (b) b.classList.remove('active'); return; }
+  if (b) b.classList.add('active');
+  const n = S.engine ? S.engine.recordedSamples : 0;
+  el.textContent = n ? `записано ${Math.round(n / 50 / 60)} хв (${n.toLocaleString('uk')} семплів)` : 'увімкнено, чекаю на датчики руху';
+}
+setInterval(updateRecInfo, 5000);
+
+$('btnAutoRec').addEventListener('click', () => {
+  const on = !autoRecOn();
+  try { localStorage.setItem('navi.autorec', on ? '1' : '0'); } catch (e) {}
+  if (on) { startAutoRec(); toast('Поїздки записуються автоматично'); }
+  else { S.engine?.stopRecording(); S.recording = false; toast('Автозапис вимкнено'); }
+  updateRecInfo();
+});
+
 $('btnRec').addEventListener('click', () => {
-  if (!S.recording) { S.engine.startRecording(); S.recording = true; $('btnRec').textContent = 'Стоп і зберегти'; toast('Запис датчиків увімкнено'); }
-  else { const log = S.engine.stopRecording(); S.recording = false; $('btnRec').textContent = 'Старт'; const blob = new Blob([JSON.stringify({ origin: S.graph.origin, log })], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `navi-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`; document.body.appendChild(a); a.click(); a.remove(); toast(`Збережено ${log.length} записів`); }
+  const log = S.engine ? S.engine.exportLog() : [];
+  if (!log.length) { toast('Записувати ще нічого — увімкніть датчики руху й проїдьте трохи'); return; }
+  const blob = new Blob([JSON.stringify({ origin: S.graph.origin, ver: $('ver')?.textContent || '', log })], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `navi-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  toast(`Збережено ${log.length.toLocaleString('uk')} записів`);
 });
 
 // Поточне місце словами: вулиця, по якій їдемо, і найближчий будинок з номером.
@@ -808,6 +887,9 @@ function loop(now) {
   setInterval(() => { try { localStorage.setItem('navi.view', JSON.stringify({ cx: S.view.cx, cy: S.view.cy, scale: S.view.scale })); } catch { } }, 5000);
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
+  updateRecInfo();
+  // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
+  if (real) autoStart();
   const seen = localStorage.getItem('navi.seen');
-  if (!seen) { hint('Натисніть «Старт»: застосунок знайде вас по мережі зв\'язку, а далі вестиме по датчиках і карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
+  if (!seen) { hint('Застосунок уже шукає вас. Торкніться екрана — увімкнуться датчики руху, і він вестиме по них і по карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
 })();

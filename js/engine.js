@@ -29,13 +29,18 @@ export class NavEngine {
     this.lastGoodGps = null;     // {t, xy} — останній довірений точний фікс
     this.lastNet = null;         // {t, xy, acc} — останній мережевий (вежі/Wi-Fi) фікс
     this.gpsTrust = 0;           // 0..1
-    this.log = [];
+    // Запис датчиків для розбору поїздки на комп'ютері. Семпли йдуть ~50 раз/с,
+    // тому тримаємо їх не об'єктами, а колонками Float32 — це вдесятеро менше пам'яті,
+    // і година їзди вміщується без проблем. Старі семпли витісняються по колу.
     this.recording = false;
+    this.maxSamples = 180000;   // ~60 хв при 50 Гц
+    this._rec = null;
+    this.fixLog = [];
   }
 
   // ---------- вхід датчиків ----------
   pushMotion(sample) {
-    if (this.recording) this.log.push({ k: 'm', ...sample });
+    if (this.recording) this._recordMotion(sample);
     const r = this.motion.pushSample(sample);
     if (!r || !r.ready) { this.state.mode = r && !r.ready ? 'calibrating' : this.state.mode; return; }
     this.gyroHeading += r.yawRate * r.dt;
@@ -78,7 +83,7 @@ export class NavEngine {
   //             людина бачить, де вона приблизно, і уточнює кнопкою «Я тут»;
   //   більше  — ігноруємо.
   pushGps(fix) {
-    if (this.recording) this.log.push({ k: 'g', ...fix });
+    if (this.recording) { this.fixLog.push({ k: 'g', ...fix }); if (this.fixLog.length > 20000) this.fixLog.splice(0, 5000); }
     const xy = this.proj.toXY(fix.lat, fix.lon);
     const acc = fix.accuracy ?? 30;
     const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'mixed' : acc <= 3000 ? 'net'
@@ -199,6 +204,11 @@ export class NavEngine {
       this.state.gps = 'rejected';
       return 'dr';
     }
+    // Коли авто стоїть, система може не надсилати нових фіксів — і це не РЕБ.
+    // Без цієї перевірки на припаркованій машині писало б «GPS глушиться».
+    if (hadGnss && age > this.gpsLostAfter && this.motion.stationary && this.state.source === 'gps') {
+      return 'gps';
+    }
     if (hadGnss && age <= this.gpsLostAfter) {
       this.state.source = 'gps';
       if (this.state.gps === 'jammed') this.state.gps = 'ok';
@@ -231,8 +241,43 @@ export class NavEngine {
 
   flipTurns() { this.motion.flipGravitySign(); }
 
-  startRecording() { this.log = []; this.recording = true; }
-  stopRecording() { this.recording = false; return this.log; }
+  startRecording(opts = {}) {
+    if (opts.maxSamples) this.maxSamples = opts.maxSamples;
+    const n = this.maxSamples;
+    this._rec = { n, i: 0, wrapped: false, t: new Float64Array(n), a: new Float32Array(n * 3), g: new Float32Array(n * 3) };
+    this.fixLog = [];
+    this.recording = true;
+  }
+
+  _recordMotion(s) {
+    const r = this._rec; if (!r) return;
+    const i = r.i;
+    r.t[i] = s.t;
+    r.a[i * 3] = s.acc[0]; r.a[i * 3 + 1] = s.acc[1]; r.a[i * 3 + 2] = s.acc[2];
+    r.g[i * 3] = s.gyro[0]; r.g[i * 3 + 1] = s.gyro[1]; r.g[i * 3 + 2] = s.gyro[2];
+    r.i = i + 1;
+    if (r.i >= r.n) { r.i = 0; r.wrapped = true; }
+  }
+
+  get recordedSamples() { const r = this._rec; return r ? (r.wrapped ? r.n : r.i) : 0; }
+
+  // Той самий формат, що читає tools/replay: [{k:'m',t,acc,gyro}, {k:'g',...}] у часовому порядку
+  exportLog() {
+    const r = this._rec, out = [];
+    if (r) {
+      const count = r.wrapped ? r.n : r.i;
+      const start = r.wrapped ? r.i : 0;
+      for (let k = 0; k < count; k++) {
+        const i = (start + k) % r.n;
+        out.push({ k: 'm', t: +r.t[i].toFixed(3), acc: [r.a[i * 3], r.a[i * 3 + 1], r.a[i * 3 + 2]].map(x => +x.toFixed(4)), gyro: [r.g[i * 3], r.g[i * 3 + 1], r.g[i * 3 + 2]].map(x => +x.toFixed(5)) });
+      }
+    }
+    for (const f of this.fixLog) out.push(f);
+    return out;
+  }
+
+  stopRecording() { this.recording = false; return this.exportLog(); }
+  clearRecording() { this._rec = null; this.fixLog = []; if (this.recording) this.startRecording(); }
 
   _updateEstimate() {
     const est = this.pf.estimate();
