@@ -71,11 +71,11 @@ function worldToScreen(x, y) {
     const rx = dx * c - dy * s, ry = dx * s + dy * c;
     dx = rx; dy = ry;
   }
-  return [w / 2 + dx, h * (v.rotate ? 0.65 : 0.5) + dy];
+  return [w / 2 + dx, h * (v.rotate ? PUCK_Y : 0.5) + dy];
 }
 function screenToWorld(sx, sy) {
   const v = S.view, w = canvas.width, h = canvas.height;
-  let dx = sx * DPR - w / 2, dy = sy * DPR - h * (v.rotate ? 0.65 : 0.5);
+  let dx = sx * DPR - w / 2, dy = sy * DPR - h * (v.rotate ? PUCK_Y : 0.5);
   if (v.rotate && S.engine?.state.xy) {
     const a = -S.engine.state.heading;
     const c = Math.cos(a), s = Math.sin(a);
@@ -303,6 +303,9 @@ function draw() {
 // ---------- жести ----------
 // Нижня межа масштабу — щоб уся область влізла в екран (понад 250 км)
 const clampScale = (v) => Math.max(0.0012, Math.min(14, v));
+// Де на екрані стоїть машинка в режимі «за курсом»: нижче центру, щоб уперед
+// було видно більше дороги, ніж позаду.
+const PUCK_Y = 0.74;
 let gesture = null;
 canvas.addEventListener('pointerdown', (e) => { canvas.setPointerCapture(e.pointerId); gesture = gesture || { pts: new Map(), moved: false }; gesture.pts.set(e.pointerId, [e.clientX, e.clientY]); gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; });
 canvas.addEventListener('pointermove', (e) => {
@@ -316,7 +319,7 @@ canvas.addEventListener('pointermove', (e) => {
   } else if (pts.length >= 2 && gesture.start.length >= 2) {
     const d0 = Math.hypot(gesture.start[0][0] - gesture.start[1][0], gesture.start[0][1] - gesture.start[1][1]);
     const d1 = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]);
-    S.view.scale = clampScale(gesture.startView.scale * d1 / Math.max(1, d0)); gesture.moved = true;
+    S.view.scale = clampScale(gesture.startView.scale * d1 / Math.max(1, d0)); gesture.moved = true; S.lastManualZoom = Date.now();
   }
   draw();
 });
@@ -326,7 +329,7 @@ const endGesture = (e) => {
   gesture.pts.delete(e.pointerId); if (!gesture.pts.size) gesture = null; else { gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; gesture.moved = true; }
 };
 canvas.addEventListener('pointerup', endGesture); canvas.addEventListener('pointercancel', endGesture);
-canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.view.scale = clampScale(S.view.scale * (e.deltaY < 0 ? 1.15 : 0.87)); draw(); }, { passive: false });
+canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.view.scale = clampScale(S.view.scale * (e.deltaY < 0 ? 1.15 : 0.87)); S.lastManualZoom = Date.now(); draw(); }, { passive: false });
 
 function onTap(sx, sy) {
   const p = screenToWorld(sx, sy);
@@ -747,7 +750,11 @@ function setOrient(rotate, say = true) {
 }
 $('btnRotate').addEventListener('click', () => setOrient(!S.view.rotate));
 $('btnOrient').addEventListener('click', () => setOrient(!S.view.rotate));
-try { setOrient(localStorage.getItem('navi.rotate') === '1', false); } catch (e) { setOrient(false, false); }
+// Рух із курсом угору — основний режим навігації, тому він типовий.
+try {
+  if (localStorage.getItem('navi.orientDefault') !== '1') { localStorage.setItem('navi.orientDefault', '1'); localStorage.setItem('navi.rotate', '1'); }
+  setOrient(localStorage.getItem('navi.rotate') !== '0', false);
+} catch (e) { setOrient(true, false); }
 $('btnSearch').addEventListener('click', openSearch);
 $('btnCenter').addEventListener('click', () => {
   const st = S.engine?.state;
@@ -801,6 +808,37 @@ function startAutoRec() {
   updateRecInfo();
 }
 
+// ---------- масштаб за швидкістю ----------
+// На трасі треба бачити далі, у місті — ближче. Міряємо не «кратністю зуму»,
+// а скільком секундам дороги попереду має вистачити екрана.
+const autoZoomOn = () => { try { return localStorage.getItem('navi.autozoom') !== '0'; } catch (e) { return true; } };
+const LOOKAHEAD_S = 25;
+
+function applyAutoZoom(speed) {
+  if (!S.follow || !autoZoomOn()) return;
+  if (gesture && gesture.pts && gesture.pts.size) return;          // поки палець на екрані — не лізем
+  if (Date.now() - (S.lastManualZoom || 0) < 10000) return;        // після ручного зуму даємо 10 с
+  const ahead = Math.max(400, Math.min(2500, speed * LOOKAHEAD_S));
+  const cssH = canvas.height / DPR;
+  const frac = S.view.rotate ? PUCK_Y : 0.5;
+  const target = clampScale(cssH * frac / ahead);
+  S.view.scale += (target - S.view.scale) * 0.04;                  // плавно, без ривків
+}
+
+function updateZoomInfo() {
+  const el = $('zoomInfo'); if (!el) return;
+  const b = $('btnAutoZoom');
+  if (b) b.classList.toggle('active', autoZoomOn());
+  el.textContent = autoZoomOn() ? `екран тримає ~${LOOKAHEAD_S} с дороги попереду` : 'вимкнено, масштаб лише вручну';
+}
+
+$('btnAutoZoom').addEventListener('click', () => {
+  const on = !autoZoomOn();
+  try { localStorage.setItem('navi.autozoom', on ? '1' : '0'); } catch (e) {}
+  toast(on ? 'Масштаб підбирається за швидкістю' : 'Масштаб лише вручну');
+  updateZoomInfo();
+});
+
 function updateScreenInfo() {
   const el = $('screenInfo'); if (!el) return;
   el.textContent = { lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: 'не вдалося втримати — екран може гаснути' }[Awake.mode] || '—';
@@ -814,7 +852,7 @@ function updateRecInfo() {
   const n = S.engine ? S.engine.recordedSamples : 0;
   el.textContent = n ? `записано ${Math.round(n / 50 / 60)} хв (${n.toLocaleString('uk')} семплів)` : 'увімкнено, чекаю на датчики руху';
 }
-setInterval(() => { updateRecInfo(); updateScreenInfo(); }, 5000);
+setInterval(() => { updateRecInfo(); updateScreenInfo(); updateZoomInfo(); }, 5000);
 
 $('btnAutoRec').addEventListener('click', () => {
   const on = !autoRecOn();
@@ -888,7 +926,7 @@ function updateStatus() {
     const word = st.spread < 40 && st.confidence > 0.5 ? 'точно' : st.spread < 150 ? 'приблизно' : 'уточнюю';
     $('conf').textContent = `${word} ±${r}`;
   }
-  if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; }
+  if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; applyAutoZoom(st.speed); }
   else if (S.follow && st.hint && !S.hintShown) {
     // показуємо коло цілком, щоб було видно, про яку частину області йдеться
     S.hintShown = true;
@@ -946,7 +984,7 @@ function loop(now) {
   setInterval(() => { try { localStorage.setItem('navi.view', JSON.stringify({ cx: S.view.cx, cy: S.view.cy, scale: S.view.scale })); } catch { } }, 5000);
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
-  updateRecInfo(); updateScreenInfo();
+  updateRecInfo(); updateScreenInfo(); updateZoomInfo();
   // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
   if (real) autoStart();
   const seen = localStorage.getItem('navi.seen');
