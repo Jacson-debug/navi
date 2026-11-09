@@ -8,6 +8,21 @@ import { Buildings, normStreet, shortStreet } from './buildings.js';
 import { Voice, turnPhrase } from './voice.js';
 
 const $ = (id) => document.getElementById(id);
+
+// ---------- чорна скринька ----------
+// На iPhone немає консолі, а після двох падінь поспіль Safari взагалі не відкриває
+// сторінку. Тому записуємо етап запуску в localStorage; якщо минулого разу до «ok»
+// не дійшли — цього разу стартуємо в безпечному режимі й кажемо, де впали.
+const STAGE_KEY = 'navi.stage';
+function stage(name) { try { localStorage.setItem(STAGE_KEY, name + '@' + Date.now()); } catch (e) {} }
+const prevStage = (() => { try { return localStorage.getItem(STAGE_KEY) || ''; } catch (e) { return ''; } })();
+const crashedLastTime = prevStage && !prevStage.startsWith('ok@');
+const SAFE = /[?&]safe=1/.test(location.search) || crashedLastTime;
+stage('boot');
+// Чисте закриття чи згортання — це не падіння: позначаємо «ok», щоб наступний
+// запуск не пішов у безпечний режим даремно. При справжньому падінні ці події не приходять.
+addEventListener('pagehide', () => stage('ok'));
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') stage('ok'); });
 const canvas = $('map'), ctx = canvas.getContext('2d');
 const DPR = Math.min(2, window.devicePixelRatio || 1);
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -459,6 +474,7 @@ async function enableMotion(opts = {}) {
   if (!('DeviceMotionEvent' in window)) { motion = false; if (!opts.quiet) toast('Цей браузер не дає датчиків руху — лише груба позиція по мережі'); }
 
   if (motion) {
+    stage('motion');
     S.t0 = null;
     addEventListener('devicemotion', onMotion);
     try { localStorage.setItem('navi.motionGranted', '1'); } catch (e) {}
@@ -494,6 +510,7 @@ function markRunning(on) {
 
 async function startSensors() {
   if (S.sensorsOn) { stopSensors(); return; }
+  stage('start');
   // Позицію вмикаємо завжди й першою: навіть якщо датчики руху заборонені або їх немає,
   // мережа зв'язку дасть хоча б грубе місцезнаходження.
   S.sensorsOn = true;
@@ -505,6 +522,7 @@ async function startSensors() {
 // Вмикається саме́ при відкритті: позиція — відразу, датчики руху — якщо дозвіл уже
 // давали раніше, інакше на першому доторку до екрана.
 async function autoStart() {
+  stage('start');
   S.sensorsOn = true;
   markRunning(true);
   startGps(); requestWakeLock();
@@ -604,10 +622,11 @@ let wakeLock = null;
 // може бути не «видимою»), повторних спроб не було — екран гас посеред поїздки.
 // Тому: повторні спроби, перезапит після згортання, і резервний шлях для iOS —
 // беззвучне відео в циклі, яке Safari вважає приводом не гасити екран.
-const KEEP_VIDEO = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAM2bW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAmB0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAEAAAABAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAAAAABAAAAAAHYbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAKABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABg21pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAUNzdGJsAAAAt3N0c2QAAAAAAAAAAQAAAKdhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAEAAQABIAAAASAAAAAAAAAABFUxhdmM2MC4zMS4xMDIgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALWF2Y0MBQsAe/+EAFmdCwB7aEJsBEAAAAwAQAAADAKDxYuoBAARozg/IAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAAFcgAABXIAAAAGHN0dHMAAAAAAAAAAQAAAAUAAAgAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAUAAAABAAAAKHN0c3oAAAAAAAAAAAAAAAUAAAKRAAAACgAAAAoAAAAKAAAACgAAABRzdGNvAAAAAAAAAAEAAANmAAAAYnVkdGEAAABabWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2MC4xNi4xMDAAAAAIZnJlZQAAAsFtZGF0AAACbwYF//9r3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0xOjA6MCBhbmFseXNlPTB4MToweDExMSBtZT1oZXggc3VibWU9MiBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MiBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj01IHNjZW5lY3V0PTQwIGludHJhX3JlZnJlc2g9MCByY19sb29rYWhlYWQ9MTAgcmM9Y3JmIG1idHJlZT0xIGNyZj0yMy4wIHFjb21wPTAuNjAgcXBtaW49MCBxcG1heD02OSBxcHN0ZXA9NCBpcF9yYXRpbz0xLjQwIGFxPTE6MS4wMACAAAAAGmWIhAR///8PRQABKr8nJyddddddddddddeAAAAABkGaIBHwjAAAAAZBmkAR8IwAAAAGQZpgEPCMAAAABkGagD/CMA==';
+const KEEP_VIDEO = 'keep.mp4';   // окремий файл: data-URI-медіа на iPhone нестабільне
 const Awake = {
   lock: null, video: null, mode: 'off', timer: null,
   async on() {
+    if (SAFE) return 'off';
     if (!this.timer) this.timer = setInterval(() => { if (S.sensorsOn && document.visibilityState === 'visible') this._ensure(); }, 15000);
     if (!this._vis) {
       this._vis = true;
@@ -632,20 +651,22 @@ const Awake = {
     this._videoOn();
   },
   _videoOn() {
+    if (SAFE) return;
+    // Тільки після дотику: створення медіа при завантаженні сторінки — підозрюваний
+    // у падіннях Safari («Повторення проблеми»).
+    if (!this._touched) {
+      if (!this._armed) { this._armed = true; const go = () => { this._touched = true; removeEventListener('pointerdown', go, true); this._videoOn(); }; addEventListener('pointerdown', go, true); }
+      return;
+    }
     if (!this.video) {
       const v = document.createElement('video');
       v.setAttribute('playsinline', ''); v.setAttribute('muted', ''); v.setAttribute('loop', '');
-      v.muted = true; v.loop = true; v.playsInline = true; v.src = KEEP_VIDEO;
+      v.muted = true; v.loop = true; v.playsInline = true; v.preload = 'auto'; v.src = KEEP_VIDEO;
       v.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0.01;pointer-events:none';
       document.body.appendChild(v);
       this.video = v;
     }
-    this.video.play().then(() => { this.mode = 'video'; }).catch(() => {
-      this.mode = 'off';
-      // play() без дотику Safari може заблокувати — пробуємо на першому ж доторку
-      const go = () => { removeEventListener('pointerdown', go, true); this.video.play().then(() => { this.mode = 'video'; }).catch(() => {}); };
-      addEventListener('pointerdown', go, true);
-    });
+    this.video.play().then(() => { this.mode = 'video'; }).catch(() => { this.mode = 'off'; });
   },
   _videoOff() { if (this.video) { this.video.pause(); } },
   off() { try { this.lock?.release(); } catch (e) {} this.lock = null; this._videoOff(); this.mode = 'off'; clearInterval(this.timer); this.timer = null; }
@@ -802,7 +823,7 @@ setInterval(updateTrafficInfo, 10000);
 const autoRecOn = () => { try { return localStorage.getItem('navi.autorec') !== '0'; } catch (e) { return true; } };
 
 function startAutoRec() {
-  if (S.recording || !S.engine) return;
+  if (S.recording || !S.engine || SAFE) return;
   S.engine.startRecording();
   S.recording = true;
   updateRecInfo();
@@ -841,7 +862,7 @@ $('btnAutoZoom').addEventListener('click', () => {
 
 function updateScreenInfo() {
   const el = $('screenInfo'); if (!el) return;
-  el.textContent = { lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: 'не вдалося втримати — екран може гаснути' }[Awake.mode] || '—';
+  el.textContent = SAFE ? 'безпечний режим — не утримується' : ({ lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: Awake._touched ? 'не вдалося втримати — екран може гаснути' : 'торкніться екрана, щоб увімкнути утримання' }[Awake.mode] || '—');
 }
 
 function updateRecInfo() {
@@ -985,8 +1006,17 @@ function loop(now) {
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
   updateRecInfo(); updateScreenInfo(); updateZoomInfo();
-  // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
-  if (real) autoStart();
+  stage('data');
+  if (SAFE) {
+    hint(crashedLastTime
+      ? `Минулого разу застосунок упав на етапі «${prevStage.split('@')[0]}». Зараз — безпечний режим: без автостарту, автозапису й утримання екрана. Натисніть «Старт», щоб їхати.`
+      : 'Безпечний режим: без автостарту, автозапису й утримання екрана.');
+    setTimeout(() => stage('ok'), 10000);
+  } else {
+    // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
+    if (real) autoStart();
+    setTimeout(() => stage('ok'), 10000);
+  }
   const seen = localStorage.getItem('navi.seen');
   if (!seen) { hint('Застосунок уже шукає вас. Торкніться екрана — увімкнуться датчики руху, і він вестиме по них і по карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
 })();
