@@ -72,54 +72,92 @@ function scratch(graph) {
  *   opts.maxExpand — стеля розкритих вузлів (типово 300 000).
  * Повертає { nodes, edges, length, time, expanded, capped } або null.
  */
-export function route(graph, fromNode, toNode, speedById = null, vmax = 25, opts = {}) {
-  if (fromNode === toNode) return { nodes: [fromNode], edges: [], length: 0, time: 0, expanded: 0, capped: false };
-  const maxExpand = opts.maxExpand ?? 300000;
+// Внутрішній крок: спільний для синхронної та покрокової версій.
+function _prepare(graph, fromNode, toNode, speedById, vmax, maxExpand) {
   const S = scratch(graph);
   if (S.gen >= 0xfffffff0) { S.stamp.fill(0); S.closed.fill(0); S.gen = 0; }
   const gen = ++S.gen;
-  const { g, prev, stamp, closed, heap } = S;
-  heap.clear();
-
+  S.heap.clear();
   const X = graph.nodeX, Y = graph.nodeY;
   const gx = X[toNode], gy = Y[toNode];
   const hdiv = speedById ? vmax : 1;
   const h = (node) => { const dx = X[node] - gx, dy = Y[node] - gy; return Math.sqrt(dx * dx + dy * dy) / hdiv; };
+  S.stamp[fromNode] = gen; S.g[fromNode] = 0; S.prev[fromNode] = -1;
+  S.heap.push(h(fromNode), fromNode);
+  return { S, gen, h, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
+}
 
-  const len = graph.len, B = graph.b;
-
-  stamp[fromNode] = gen; g[fromNode] = 0; prev[fromNode] = -1;
-  heap.push(h(fromNode), fromNode);
-  let expanded = 0, found = false, capped = false;
-
+// Виконує до `budget` розкриттів. Повертає true, коли пошук завершено.
+function _step(st, budget) {
+  const { S, gen, h, graph, toNode, speedById } = st;
+  const { g, prev, stamp, closed, heap } = S;
+  const len = graph.len, B = graph.b, outOff = graph.outOff, outList = graph.outList;
+  let n = 0;
   while (heap.n) {
     const u = heap.pop();
-    if (u === toNode) { found = true; break; }
+    if (u === toNode) { st.found = true; return true; }
     if (closed[u] === gen) continue;
     closed[u] = gen;
-    if (++expanded > maxExpand) { capped = true; break; }
+    if (++st.expanded > st.maxExpand) { st.capped = true; return true; }
     const gu = g[u];
-    const outs = graph.outEdges(u);
-    for (let k = 0; k < outs.length; k++) {
-      const eid = outs[k], nb = B[eid];
+    // без subarray(): у JavaScriptCore створення view на кожен вузол — помітна ціна
+    for (let k = outOff[u], end = outOff[u + 1]; k < end; k++) {
+      const eid = outList[k], nb = B[eid];
       if (closed[nb] === gen) continue;
       const ng = gu + (speedById ? len[eid] / Math.max(0.3, speedById(eid)) : len[eid]);
       if (stamp[nb] !== gen || ng < g[nb]) {
         stamp[nb] = gen; g[nb] = ng; prev[nb] = eid;
-        heap.push(ng + h(nb), nb);
+        const hn = h(nb); if (hn < st.bestH) st.bestH = hn;
+        heap.push(ng + hn, nb);
       }
     }
+    if (++n >= budget) return false;
   }
-  if (!found) { route.lastExpanded = expanded; route.lastCapped = capped; return null; }
+  return true;
+}
 
+function _finish(st) {
+  const { S, graph, fromNode, toNode, speedById, expanded } = st;
+  route.lastExpanded = expanded; route.lastCapped = st.capped;
+  if (!st.found) return null;
+  const len = graph.len, prev = S.prev;
   const edges = [], nodes = [toNode];
   let cur = toNode;
   while (cur !== fromNode) { const eid = prev[cur]; edges.push(eid); cur = graph.a[eid]; nodes.push(cur); }
   edges.reverse(); nodes.reverse();
   let length = 0, time = 0;
   for (const eid of edges) { length += len[eid]; time += speedById ? len[eid] / Math.max(0.3, speedById(eid)) : len[eid] / 11; }
-  route.lastExpanded = expanded; route.lastCapped = false;
   return { nodes, edges, length, time, expanded, capped: false };
+}
+
+/**
+ * route(graph, fromNode, toNode, speedById?, vmax?, opts?) — синхронно (для симуляцій і тестів).
+ */
+export function route(graph, fromNode, toNode, speedById = null, vmax = 25, opts = {}) {
+  if (fromNode === toNode) return { nodes: [fromNode], edges: [], length: 0, time: 0, expanded: 0, capped: false };
+  const st = _prepare(graph, fromNode, toNode, speedById, vmax, opts.maxExpand ?? 300000);
+  _step(st, Infinity);
+  return _finish(st);
+}
+
+/**
+ * routeAsync(...) — те саме, але шматками по ~sliceMs, не блокуючи інтерфейс.
+ * onProgress(0..1) викликається між шматками. opts.timeoutMs — стеля часу (типово 8 с).
+ */
+export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax = 25, opts = {}, onProgress = null) {
+  if (fromNode === toNode) return { nodes: [fromNode], edges: [], length: 0, time: 0, expanded: 0, capped: false };
+  const st = _prepare(graph, fromNode, toNode, speedById, vmax, opts.maxExpand ?? 300000);
+  const sliceMs = opts.sliceMs ?? 12, t0 = performance.now(), timeoutMs = opts.timeoutMs ?? 8000;
+  let done = false;
+  while (!done) {
+    const ts = performance.now();
+    while (!done && performance.now() - ts < sliceMs) done = _step(st, 2000);
+    if (done) break;
+    if (performance.now() - t0 > timeoutMs) { st.capped = true; break; }
+    if (onProgress) onProgress(Math.max(0, Math.min(0.99, 1 - st.bestH / Math.max(1, st.h0))));
+    await new Promise(r => setTimeout(r, 0));
+  }
+  return _finish(st);
 }
 
 // Швидкість ребра за id з «пам'яті пробок»: спостереження, якщо є, інакше вільна за класом.
