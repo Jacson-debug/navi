@@ -1,7 +1,7 @@
 // Наві — застосунок. Карта на canvas, датчики, GPS, АЗС зі статусами, маршрут, демо.
 import { RoadGraph } from './graph.js';
 import { NavEngine } from './engine.js';
-import { route, instructions } from './astar.js';
+import { route, instructions, speedByIdFrom } from './astar.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
 import { Buildings, normStreet, shortStreet } from './buildings.js';
@@ -375,16 +375,40 @@ function setFuelStatus(id, status) {
 }
 function ago(t) { const m = Math.round((Date.now() - t) / 60000); return m < 1 ? 'щойно' : m < 60 ? `${m} хв тому` : m < 1440 ? `${Math.round(m / 60)} год тому` : `${Math.round(m / 1440)} дн тому`; }
 // ---------- маршрут ----------
+function isIsolated(g, node, limit = 400) {
+  const seen = new Set([node]); const stack = [node];
+  while (stack.length) {
+    const u = stack.pop();
+    const outs = g.outEdges(u);
+    for (let k = 0; k < outs.length; k++) {
+      const nb = g.b[outs[k]];
+      if (!seen.has(nb)) { seen.add(nb); if (seen.size >= limit) return false; stack.push(nb); }
+    }
+  }
+  return true;
+}
+
 function routeTo(f) {
   const st = S.engine?.state;
   if (!st?.xy) { toast('Спочатку визначте позицію: «Я тут» або ⋯ → «Визначити по мережі»'); return; }
   const g = S.graph;
   // Беремо кілька варіантів старту й фінішу: вузол може виявитись у глухому куті
   // або в маленькій відрізаній частині графа, тоді пробуємо наступний.
-  const froms = [st.edge ? st.edge.b : null, ...g.nearestNodes(st.xy, 600, 1, 6)].filter(x => x !== null);
-  const tos = [...g.nearestNodes([f.x, f.y], 600, 1, 8), g.nearestNode([f.x, f.y])];
-  let r = null;
-  for (const from of froms) { for (const to of tos) { r = route(g, from, to, S.traffic.speedFn(), VMAX); if (r) break; } if (r) break; }
+  // Раніше тут було до 63 повних пошуків поспіль (7 стартів × 9 фінішів), і якщо ціль
+  // недосяжна, телефон зависав на хвилини, а Safari вбивав сторінку. Тепер: один старт,
+  // до трьох фінішів, кожен спершу дешево перевіряється, чи не сидить у відрізаному шматку.
+  const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
+  const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
+  const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
+  let r = null; const t0 = performance.now(); let tries = 0;
+  for (const to of tos) {
+    if (isIsolated(g, to)) continue;
+    tries++;
+    r = route(g, from, to, speedById, VMAX, { maxExpand: 300000 });
+    if (r) break;
+    if (performance.now() - t0 > 2500) break;   // досить — не підвішуємо телефон
+  }
+  console.log(`маршрут: ${tries} спроб, ${Math.round(performance.now() - t0)} мс, розкрито ${route.lastExpanded ?? '?'}`);
   if (!r) {
     toast(`Не вдалося прокласти шлях до «${f.name || 'цілі'}» — можливо, туди немає проїзду по карті`);
     S.target = f; S.follow = false; S.view.cx = f.x; S.view.cy = f.y; draw();
@@ -416,9 +440,11 @@ function updateTurn() {
     from = -1;
   } else {
     // З'їхали з маршруту — перебудовуємо від поточного місця
-    if (S.target && S.rebuildAt !== st.edge.id) {
-      S.rebuildAt = st.edge.id;
-      const r = route(g, st.edge.b, g.nearestNode([S.target.x, S.target.y]), S.traffic.speedFn(), VMAX);
+    // Перебудова не частіше ніж раз на 4 с і з меншою стелею: це гарячий шлях під час руху
+    if (S.target && S.rebuildAt !== st.edge.id && Date.now() - (S.rebuildT || 0) > 4000) {
+      S.rebuildAt = st.edge.id; S.rebuildT = Date.now();
+      const to = S.routeInfo ? S.routeInfo.nodes[S.routeInfo.nodes.length - 1] : g.nearestNode([S.target.x, S.target.y]);
+      const r = route(g, st.edge.b, to, speedByIdFrom(g, S.traffic, TrafficMemory.slot()), VMAX, { maxExpand: 150000 });
       if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; toast('Перебудовую маршрут'); }
     }
     el.classList.remove('show');
