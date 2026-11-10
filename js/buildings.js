@@ -14,7 +14,10 @@ export class Buildings {
     const b = new Buildings();
     b.streets = streets;
     b.x = take(Float32Array, nB); b.y = take(Float32Array, nB); b.street = take(Int32Array, nB);
-    b.num = json(u32());
+    // 335 тис. рядків-номерів тримати в купі дорого (~15 МБ на iPhone). Різних
+    // номерів лише ~7 тис., тому: словник + Uint16-індекс на кожен будинок.
+    { const raw = json(u32()); b._dict = []; const map = new Map(); b._numIx = new Uint16Array(raw.length);
+      for (let i = 0; i < raw.length; i++) { const v = raw[i] || ''; let ix = map.get(v); if (ix === undefined) { ix = b._dict.length; map.set(v, ix); b._dict.push(v); } b._numIx[i] = ix; } }
     const total = u32(); b.outCount = take(Uint16Array, nB); b.outXY = take(Float32Array, total * 2);
     b.outOff = new Uint32Array(nB + 1); for (let i = 0; i < nB; i++) b.outOff[i + 1] = b.outOff[i] + b.outCount[i];
     b.ex = take(Float32Array, nE); b.ey = take(Float32Array, nE); b.eref = json(u32());
@@ -22,21 +25,34 @@ export class Buildings {
     return b;
   }
 
+  num(i) { return this._dict[this._numIx[i]]; }
+
   _index() {
-    // сітка 250 м для будинків і під'їздів
+    // Сітка 250 м. Замість Map<рядок, масив> — порядок індексів, відсортований за
+    // ключем комірки, і бінарний пошук: у 10 разів менше пам'яті, та сама швидкість.
     const cell = this.cell = 250;
     const mk = (xs, ys) => {
-      const m = new Map();
-      for (let i = 0; i < xs.length; i++) { const k = Math.floor(xs[i] / cell) + ',' + Math.floor(ys[i] / cell); let a = m.get(k); if (!a) m.set(k, (a = [])); a.push(i); }
-      return m;
+      const n = xs.length, keys = new Float64Array(n), order = new Uint32Array(n);
+      for (let i = 0; i < n; i++) { keys[i] = this._key(Math.floor(xs[i] / cell), Math.floor(ys[i] / cell)); order[i] = i; }
+      order.sort((a, b) => keys[a] - keys[b]);
+      const sortedKeys = new Float64Array(n); for (let k = 0; k < n; k++) sortedKeys[k] = keys[order[k]];
+      return { order, keys: sortedKeys };
     };
     this.gridB = mk(this.x, this.y); this.gridE = mk(this.ex, this.ey);
     // нормалізовані назви вулиць для пошуку
     this.streetNorm = this.streets.map(normStreet);
-    // індекс: вулиця → список будинків
-    this.byStreet = new Map();
-    for (let i = 0; i < this.x.length; i++) { const s = this.street[i]; if (s < 0 || !this.num[i]) continue; let a = this.byStreet.get(s); if (!a) this.byStreet.set(s, (a = [])); a.push(i); }
+    // індекс: вулиця → будинки з номером (CSR)
+    const nS = this.streets.length, cnt = new Uint32Array(nS + 1);
+    for (let i = 0; i < this.x.length; i++) { const s = this.street[i]; if (s >= 0 && this._numIx[i] !== this._emptyIx()) cnt[s + 1]++; }
+    for (let s = 0; s < nS; s++) cnt[s + 1] += cnt[s];
+    this.streetOff = cnt; this.streetList = new Uint32Array(cnt[nS]); const fill = new Uint32Array(nS);
+    for (let i = 0; i < this.x.length; i++) { const s = this.street[i]; if (s >= 0 && this._numIx[i] !== this._emptyIx()) this.streetList[cnt[s] + fill[s]++] = i; }
   }
+  _emptyIx() { if (this._eIx === undefined) { const k = this._dict.indexOf(''); this._eIx = k < 0 ? -1 : k; } return this._eIx; }
+  _key(gx, gy) { return (gx + 1e5) * 1e6 + (gy + 1e5); }
+  _houses(s) { return this.streetList.subarray(this.streetOff[s], this.streetOff[s + 1]); }
+  // перший індекс у keys, де keys[k] >= key
+  _lower(keys, key) { let lo = 0, hi = keys.length; while (lo < hi) { const m = (lo + hi) >> 1; if (keys[m] < key) lo = m + 1; else hi = m; } return lo; }
 
   get count() { return this.x.length; }
   get entranceCount() { return this.ex.length; }
@@ -45,9 +61,13 @@ export class Buildings {
     const out = [];
     const gx0 = Math.floor(x0 / this.cell), gx1 = Math.floor(x1 / this.cell), gy0 = Math.floor(y0 / this.cell), gy1 = Math.floor(y1 / this.cell);
     if ((gx1 - gx0 + 1) * (gy1 - gy0 + 1) > 400) return out;
+    const { order, keys } = grid;
     for (let gx = gx0; gx <= gx1; gx++) for (let gy = gy0; gy <= gy1; gy++) {
-      const a = grid.get(gx + ',' + gy); if (!a) continue;
-      for (const i of a) { if (xs[i] >= x0 && xs[i] <= x1 && ys[i] >= y0 && ys[i] <= y1) { out.push(i); if (out.length >= limit) return out; } }
+      const key = this._key(gx, gy);
+      for (let k = this._lower(keys, key); k < keys.length && keys[k] === key; k++) {
+        const i = order[k];
+        if (xs[i] >= x0 && xs[i] <= x1 && ys[i] >= y0 && ys[i] <= y1) { out.push(i); if (out.length >= limit) return out; }
+      }
     }
     return out;
   }
@@ -55,13 +75,13 @@ export class Buildings {
   entrancesInBox(x0, y0, x1, y1, limit = 1000) { return this._inBox(this.gridE, this.ex, this.ey, x0, y0, x1, y1, limit); }
 
   outline(i) { return this.outXY.subarray(this.outOff[i] * 2, this.outOff[i + 1] * 2); }
-  label(i) { const s = this.street[i] >= 0 ? this.streets[this.street[i]] : ''; return (s ? shortStreet(s) + ', ' : '') + (this.num[i] || ''); }
+  label(i) { const s = this.street[i] >= 0 ? this.streets[this.street[i]] : ''; return (s ? shortStreet(s) + ', ' : '') + (this.num(i) || ''); }
 
   // Найближчий будинок з адресою до точки (м)
   nearest(p, r = 120) {
     let best = -1, bd = r;
     for (const i of this.buildingsInBox(p[0] - r, p[1] - r, p[0] + r, p[1] + r)) {
-      if (!this.num[i]) continue;
+      if (!this.num(i)) continue;
       const d = Math.hypot(this.x[i] - p[0], this.y[i] - p[1]); if (d < bd) { bd = d; best = i; }
     }
     return best;
@@ -81,10 +101,10 @@ export class Buildings {
     for (let s = 0; s < this.streets.length; s++) {
       const n = this.streetNorm[s];
       if (!streetToks.every(t => n.includes(t))) continue;
-      const houses = this.byStreet.get(s); if (!houses) continue;
+      const houses = this._houses(s); if (!houses.length) continue;
       if (num) {
         const nn = normNum(num);
-        for (const i of houses) { const hn = normNum(this.num[i]); if (hn === nn) res.push({ i, exact: 2 }); else if (hn.startsWith(nn)) res.push({ i, exact: 1 }); }
+        for (const i of houses) { const hn = normNum(this.num(i)); if (hn === nn) res.push({ i, exact: 2 }); else if (hn.startsWith(nn)) res.push({ i, exact: 1 }); }
       } else {
         // без номера — показати вулицю як пункт (перший будинок) + кілька будинків
         res.push({ i: houses[0], exact: 0, streetOnly: true, s, count: houses.length });

@@ -19,7 +19,7 @@ export class Voice {
   warmup() { if (this.ok) { const u = new SpeechSynthesisUtterance(''); speechSynthesis.speak(u); } }
 
   say(text, key = text, minGap = 8) {
-    if (!this.ok || !this.enabled) return;
+    if (!this.ok || !this.enabled || window.NAVI_SAFE) return;
     const now = Date.now();
     if (key === this.last.key && now - this.last.t < minGap * 1000) return;
     this.last = { key, t: now };

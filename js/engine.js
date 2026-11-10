@@ -38,7 +38,7 @@ export class NavEngine {
     // тому тримаємо їх не об'єктами, а колонками Float32 — це вдесятеро менше пам'яті,
     // і година їзди вміщується без проблем. Старі семпли витісняються по колу.
     this.recording = false;
-    this.maxSamples = 180000;   // ~60 хв при 50 Гц
+    this.maxSamples = 90000;    // ~30 хв при 50 Гц (~3 МБ)
     this._rec = null;
     this.fixLog = [];
   }

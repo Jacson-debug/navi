@@ -7,7 +7,7 @@
 //   DATA  — карта, будинки, АЗС, назви місцевостей: десятки мегабайтів.
 //           Лежить окремо, щоб оновлення коду НЕ змушувало телефон качати їх знову
 //           через мобільний інтернет.
-const SHELL_CACHE = 'navi-shell-v0.8.5';
+const SHELL_CACHE = 'navi-shell-v0.8.9';
 const DATA_CACHE = 'navi-data-v1';
 const KEEP = [SHELL_CACHE, DATA_CACHE];
 const SHELL = ['./', './index.html', './manifest.webmanifest', './keep.mp4',
@@ -15,8 +15,18 @@ const SHELL = ['./', './index.html', './manifest.webmanifest', './keep.mp4',
   './js/astar.js', './js/geo.js', './js/traffic.js', './js/buildings.js', './js/voice.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
+// Кожен файл окремо: якщо один не завантажився, решта все одно в кеші й нова
+// версія встановлюється. Раніше addAll падав цілком через будь-який 404 — і телефон
+// міг назавжди лишитися на старій версії.
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(SHELL_CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(SHELL_CACHE)
+    .then(c => Promise.allSettled(SHELL.map(u => fetch(u, { cache: 'no-store' }).then(r => { if (r.ok) return c.put(u, r); }))))
+    .then(() => self.skipWaiting()));
+});
+// Сторінка може попросити версію SW або повне очищення коду
+self.addEventListener('message', (e) => {
+  if (e.data === 'version') e.source?.postMessage({ swVersion: SHELL_CACHE });
+  if (e.data === 'purge') e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== DATA_CACHE).map(k => caches.delete(k)))).then(() => self.registration.unregister()));
 });
 self.addEventListener('activate', (e) => {
   e.waitUntil(caches.keys()

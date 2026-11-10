@@ -13,16 +13,76 @@ const $ = (id) => document.getElementById(id);
 // На iPhone немає консолі, а після двох падінь поспіль Safari взагалі не відкриває
 // сторінку. Тому записуємо етап запуску в localStorage; якщо минулого разу до «ok»
 // не дійшли — цього разу стартуємо в безпечному режимі й кажемо, де впали.
-const STAGE_KEY = 'navi.stage';
-function stage(name) { try { localStorage.setItem(STAGE_KEY, name + '@' + Date.now()); } catch (e) {} }
+const STAGE_KEY = 'navi.stage', TRAIL_KEY = 'navi.trail', ERR_KEY = 'navi.lasterr';
+function stage(name) {
+  try {
+    localStorage.setItem(STAGE_KEY, name + '@' + Date.now());
+    const trail = JSON.parse(localStorage.getItem(TRAIL_KEY) || '[]');
+    trail.push(new Date().toTimeString().slice(0, 8) + ' ' + name);
+    while (trail.length > 25) trail.shift();
+    localStorage.setItem(TRAIL_KEY, JSON.stringify(trail));
+  } catch (e) {}
+}
+function logErr(msg) {
+  try {
+    const prev = JSON.parse(localStorage.getItem(ERR_KEY) || '[]');
+    prev.push(new Date().toTimeString().slice(0, 8) + ' ' + String(msg).slice(0, 300));
+    while (prev.length > 10) prev.shift();
+    localStorage.setItem(ERR_KEY, JSON.stringify(prev));
+  } catch (e) {}
+}
+addEventListener('error', (e) => logErr((e.message || e.type) + (e.filename ? ` @${e.filename.split('/').pop()}:${e.lineno}` : '')));
+addEventListener('unhandledrejection', (e) => logErr('promise: ' + (e.reason?.message || e.reason)));
 const prevStage = (() => { try { return localStorage.getItem(STAGE_KEY) || ''; } catch (e) { return ''; } })();
-const crashedLastTime = prevStage && !prevStage.startsWith('ok@');
+// iOS при закритті через перемикач застосунків НЕ надсилає pagehide, тож один
+// «недійшов до ok» — це найчастіше просто закриття, а не падіння. Безпечний режим
+// лише після ДВОХ таких запусків поспіль (Safari теж блокує сторінку після двох).
+const CRASH_KEY = 'navi.crashes';
+let crashCount = 0;
+try {
+  crashCount = +localStorage.getItem(CRASH_KEY) || 0;
+  if (prevStage && !prevStage.startsWith('ok@')) crashCount++; else crashCount = 0;
+  localStorage.setItem(CRASH_KEY, String(crashCount));
+} catch (e) {}
+const crashedLastTime = crashCount >= 2;
 const SAFE = /[?&]safe=1/.test(location.search) || crashedLastTime;
+function leaveSafeMode() { try { localStorage.setItem(CRASH_KEY, '0'); localStorage.setItem(STAGE_KEY, 'ok@' + Date.now()); } catch (e) {} location.replace(location.pathname); }
+function markOk() { stage('ok'); try { localStorage.setItem(CRASH_KEY, '0'); } catch (e) {} }
+window.NAVI_SAFE = SAFE;
 stage('boot');
+
+// ---------- примусове оновлення коду ----------
+// Service worker може «залипнути» на старій версії. Тому: (1) ?reset=1 зносить усі
+// кеші коду й реєстрацію SW; (2) сторінка сама звіряє свою версію з сервером і
+// пропонує оновитися; (3) кнопка в «⋯» робить те саме вручну.
+async function hardReset() {
+  try {
+    const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+    for (const r of regs) await r.unregister();
+    const keys = await caches.keys();
+    for (const k of keys) if (!k.startsWith('navi-data')) await caches.delete(k);
+  } catch (e) {}
+  location.replace(location.pathname + '?v=' + Date.now());
+}
+if (/[?&]reset=1/.test(location.search)) hardReset();
+
+async function checkServerVersion() {
+  try {
+    const res = await fetch('index.html?nocache=' + Date.now(), { cache: 'no-store' });
+    const txt = await res.text();
+    const m = txt.match(/id="ver">([^<]+)</);
+    const server = m && m[1].trim(), mine = ($('ver')?.textContent || '').trim();
+    window.NAVI_SERVER_VER = server;
+    if (server && mine && server !== mine) {
+      hint(`Є нова версія ${server} (у вас ${mine}). Оновити: «⋯» → «Оновити код».`);
+    }
+    return server;
+  } catch (e) { return null; }
+}
 // Чисте закриття чи згортання — це не падіння: позначаємо «ok», щоб наступний
 // запуск не пішов у безпечний режим даремно. При справжньому падінні ці події не приходять.
-addEventListener('pagehide', () => stage('ok'));
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') stage('ok'); });
+addEventListener('pagehide', () => markOk());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') markOk(); });
 const canvas = $('map'), ctx = canvas.getContext('2d');
 const DPR = Math.min(2, window.devicePixelRatio || 1);
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
@@ -57,8 +117,13 @@ async function loadData() {
     $('dataInfo').textContent = `${graph.meta?.name || 'карта'}: ${graph.nNodes} вузлів, ${graph.n} доріг, ${fuel.length} АЗС`;
     hint('');
     S.bldLoading = true;
-    fetch('data/places.json').then(async r => { if (r.ok) { S.places = await r.json(); draw(); } }).catch(() => { });
-    fetch('data/buildings.bin').then(async r => { if (!r.ok) return; S.bld = Buildings.fromBinary(await r.arrayBuffer()); $('dataInfo').textContent += `, ${S.bld.count} будинків, ${S.bld.entranceCount} під'їздів`; S.bldLoading = false; draw(); }).catch(() => { S.bldLoading = false; });
+    // Послідовно, а не паралельно: кожен файл на піку розпакування займає вдвічі
+    // більше за себе, і два піки разом на iPhone уже били в стелю пам'яті.
+    // Помилку більше не ковтаємо: без будинків не працює пошук адрес і «де я».
+    (async () => {
+      await loadBuildings();
+      try { const r = await fetch('data/places.json'); if (r.ok) { S.places = await r.json(); draw(); } } catch (e) { logErr('places: ' + e.message); }
+    })();
     return { graph, fuel, real: true };
   } catch (e) {
     // Краще чесно сказати, що карти немає, ніж підсунути вигадане місто
@@ -66,6 +131,28 @@ async function loadData() {
     hint('Карта не завантажилась. Відкрийте застосунок з інтернетом хоча б раз, щоб він її зберіг.');
     toast('Немає даних карти');
     throw e;
+  }
+}
+
+async function loadBuildings(attempt = 1) {
+  S.bldLoading = true;
+  try {
+    stage('bld:fetch');
+    const r = await fetch('data/buildings.bin');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    let buf = await r.arrayBuffer();
+    stage('bld:parse');
+    S.bld = Buildings.fromBinary(buf);
+    buf = null;
+    $('dataInfo').textContent += `, ${S.bld.count} будинків, ${S.bld.entranceCount} під'їздів`;
+    S.bldLoading = false;
+    stage('bld:ok');
+    draw();
+  } catch (e) {
+    S.bldLoading = false;
+    logErr('buildings: ' + e.message);
+    if (attempt < 2) { setTimeout(() => loadBuildings(attempt + 1), 4000); return; }
+    toast('Будинки не завантажились — пошук адрес не працюватиме. Деталі в «⋯» → «Журнал»');
   }
 }
 
@@ -401,6 +488,7 @@ function routeTo(f) {
   const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
   const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
   let r = null; const t0 = performance.now(); let tries = 0;
+  stage('route:search');
   for (const to of tos) {
     if (isIsolated(g, to)) continue;
     tries++;
@@ -414,12 +502,17 @@ function routeTo(f) {
     S.target = f; S.follow = false; S.view.cx = f.x; S.view.cy = f.y; draw();
     return;
   }
+  stage('route:instructions');
   S.routeInfo = r; S.target = f; S.routeSteps = instructions(g, r); S.lastSpoken = null;
   S.follow = true;
   const km = (r.length / 1000).toFixed(1), min = Math.max(1, Math.round(r.time / 60));
   toast(`${f.name || 'Маршрут'} · ${km} км · ~${min} хв`);
-  S.voice?.say(`Маршрут побудовано, ${km.replace('.', ' і ')} кілометра, приблизно ${min} хвилин`, 'route', 0);
+  stage('route:voice');
+  if (!SAFE) S.voice?.say(`Маршрут побудовано, ${km.replace('.', ' і ')} кілометра, приблизно ${min} хвилин`, 'route', 0);
+  stage('route:draw');
   draw(); updateTurn();
+  stage('route:done');
+  setTimeout(markOk, 3000);
 }
 
 function updateTurn() {
@@ -652,7 +745,6 @@ const KEEP_VIDEO = 'keep.mp4';   // окремий файл: data-URI-медіа
 const Awake = {
   lock: null, video: null, mode: 'off', timer: null,
   async on() {
-    if (SAFE) return 'off';
     if (!this.timer) this.timer = setInterval(() => { if (S.sensorsOn && document.visibilityState === 'visible') this._ensure(); }, 15000);
     if (!this._vis) {
       this._vis = true;
@@ -886,9 +978,40 @@ $('btnAutoZoom').addEventListener('click', () => {
   updateZoomInfo();
 });
 
+function updateTrailInfo() {
+  const el = $('trailInfo'); if (!el) return;
+  let trail = [], errs = [];
+  try { trail = JSON.parse(localStorage.getItem(TRAIL_KEY) || '[]'); errs = JSON.parse(localStorage.getItem(ERR_KEY) || '[]'); } catch (e) {}
+  const ua = navigator.userAgent.match(/iPhone OS (\d+_\d+)/)?.[1]?.replace('_', '.') || '';
+  const sv = window.NAVI_SERVER_VER ? ` · на сервері ${window.NAVI_SERVER_VER}` : '';
+  const env = [
+    navigator.standalone ? 'з екрана Домівка' : 'у браузері',
+    `${screen.width}×${screen.height}@${window.devicePixelRatio}`,
+    'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
+    'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
+    'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
+    performance.memory ? `пам'ять JS: ${Math.round(performance.memory.usedJSHeapSize / 1048576)} МБ` : null,
+  ].filter(Boolean).join('\n');
+  el.textContent = `${$('ver')?.textContent || ''}${sv}${ua ? ' · iOS ' + ua : ''}${SAFE ? ' · безпечний режим' : ''}\n${env}\n`
+    + (errs.length ? 'ПОМИЛКИ:\n' + errs.slice(-5).join('\n') + '\n' : '')
+    + 'етапи: ' + trail.slice(-12).join(' → ');
+}
+$('btnUpdate')?.addEventListener('click', async () => { toast('Оновлюю код…'); await hardReset(); });
+if ($('safeInfo')) {
+  $('safeInfo').textContent = SAFE ? 'увімкнений: без голосу й автозапису' : 'вимкнений — усе працює звичайно';
+  $('btnSafeExit').textContent = SAFE ? 'Вийти' : 'Увімкнути';
+  $('btnSafeExit').addEventListener('click', () => SAFE ? leaveSafeMode() : location.replace(location.pathname + '?safe=1'));
+}
+$('btnTrailCopy')?.addEventListener('click', async () => {
+  const txt = $('trailInfo').textContent;
+  try { await navigator.clipboard.writeText(txt); toast('Журнал скопійовано — вставте його мені в чат'); }
+  catch (e) { toast('Не вдалося скопіювати — зробіть скриншот'); }
+});
+$('btnTrailClear')?.addEventListener('click', () => { try { localStorage.removeItem(TRAIL_KEY); localStorage.removeItem(ERR_KEY); } catch (e) {} updateTrailInfo(); toast('Журнал очищено'); });
+
 function updateScreenInfo() {
   const el = $('screenInfo'); if (!el) return;
-  el.textContent = SAFE ? 'безпечний режим — не утримується' : ({ lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: Awake._touched ? 'не вдалося втримати — екран може гаснути' : 'торкніться екрана, щоб увімкнути утримання' }[Awake.mode] || '—');
+  el.textContent = ({ lock: 'екран не гасне (системне утримання)', video: 'екран не гасне (резервний спосіб)', off: Awake._touched ? 'не вдалося втримати — екран може гаснути' : 'торкніться екрана, щоб увімкнути утримання' }[Awake.mode] || '—');
 }
 
 function updateRecInfo() {
@@ -899,7 +1022,7 @@ function updateRecInfo() {
   const n = S.engine ? S.engine.recordedSamples : 0;
   el.textContent = n ? `записано ${Math.round(n / 50 / 60)} хв (${n.toLocaleString('uk')} семплів)` : 'увімкнено, чекаю на датчики руху';
 }
-setInterval(() => { updateRecInfo(); updateScreenInfo(); updateZoomInfo(); }, 5000);
+setInterval(() => { updateRecInfo(); updateScreenInfo(); updateZoomInfo(); updateTrailInfo(); }, 5000);
 
 $('btnAutoRec').addEventListener('click', () => {
   const on = !autoRecOn();
@@ -1031,18 +1154,19 @@ function loop(now) {
   setInterval(() => { try { localStorage.setItem('navi.view', JSON.stringify({ cx: S.view.cx, cy: S.view.cy, scale: S.view.scale })); } catch { } }, 5000);
   resize(); requestAnimationFrame(loop);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => { });
-  updateRecInfo(); updateScreenInfo(); updateZoomInfo();
+  updateRecInfo(); updateScreenInfo(); updateZoomInfo(); updateTrailInfo();
   stage('data');
+  if (navigator.onLine) setTimeout(checkServerVersion, 4000);
   if (SAFE) {
     hint(crashedLastTime
-      ? `Минулого разу застосунок упав на етапі «${prevStage.split('@')[0]}». Зараз — безпечний режим: без автостарту, автозапису й утримання екрана. Натисніть «Старт», щоб їхати.`
-      : 'Безпечний режим: без автостарту, автозапису й утримання екрана.');
-    setTimeout(() => stage('ok'), 10000);
+      ? `Два запуски поспіль не дійшли до кінця (останній — етап «${prevStage.split('@')[0]}»). Зараз безпечний режим: без голосу й автозапису. Вийти — у «⋯» → «Безпечний режим».`
+      : 'Безпечний режим: без голосу й автозапису.');
+    setTimeout(markOk, 3000);
   } else {
-    // Нічого натискати не треба: позиція вмикається сама, датчики руху — щойно буде дотик.
-    if (real) autoStart();
-    setTimeout(() => stage('ok'), 10000);
+    setTimeout(markOk, 3000);
   }
+  // Позиція вмикається сама навіть у безпечному режимі: GPS до падінь стосунку не має.
+  if (real) autoStart();
   const seen = localStorage.getItem('navi.seen');
   if (!seen) { hint('Застосунок уже шукає вас. Торкніться екрана — увімкнуться датчики руху, і він вестиме по них і по карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
 })();

@@ -57,7 +57,7 @@ function scratch(graph) {
   if (graph._astar) return graph._astar;
   const n = graph.nNodes;
   return (graph._astar = {
-    g: new Float64Array(n),       // вартість від старту
+    g: new Float32Array(n),       // вартість від старту
     prev: new Int32Array(n),      // ребро, яким прийшли
     stamp: new Uint32Array(n),    // «покоління» запису — щоб не чистити масиви щоразу
     closed: new Uint32Array(n),
