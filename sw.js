@@ -7,7 +7,7 @@
 //   DATA  — карта, будинки, АЗС, назви місцевостей: десятки мегабайтів.
 //           Лежить окремо, щоб оновлення коду НЕ змушувало телефон качати їх знову
 //           через мобільний інтернет.
-const SHELL_CACHE = 'navi-shell-v0.8.10';
+const SHELL_CACHE = 'navi-shell-v0.8.11';
 const DATA_CACHE = 'navi-data-v1';
 const KEEP = [SHELL_CACHE, DATA_CACHE];
 const SHELL = ['./', './index.html', './manifest.webmanifest', './keep.mp4',

@@ -53,6 +53,7 @@ class MinHeap {
 }
 
 // Робочі буфери живуть на графі й перевикористовуються між викликами (~10 МБ один раз).
+export function prepareRouting(graph) { return scratch(graph); }
 function scratch(graph) {
   if (graph._astar) return graph._astar;
   const n = graph.nNodes;

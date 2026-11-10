@@ -1,7 +1,7 @@
 // Наві — застосунок. Карта на canvas, датчики, GPS, АЗС зі статусами, маршрут, демо.
 import { RoadGraph } from './graph.js';
 import { NavEngine } from './engine.js';
-import { route, routeAsync, instructions, speedByIdFrom } from './astar.js';
+import { route, routeAsync, instructions, speedByIdFrom, prepareRouting } from './astar.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
 import { Buildings, normStreet, shortStreet } from './buildings.js';
@@ -115,6 +115,7 @@ async function loadData() {
     }
     const fuel = f.ok ? await f.json() : [];
     $('dataInfo').textContent = `${graph.meta?.name || 'карта'}: ${graph.nNodes} вузлів, ${graph.n} доріг, ${fuel.length} АЗС`;
+    try { stage('route:alloc'); prepareRouting(graph); stage('route:alloc-ok'); } catch (e) { logErr('alloc: ' + e.message); }
     hint('');
     S.bldLoading = true;
     // Послідовно, а не паралельно: кожен файл на піку розпакування займає вдвічі
@@ -483,19 +484,24 @@ async function routeTo(f) {
   // Один старт, до трьох фінішів, кожен спершу дешево перевіряється, чи не сидить у
   // відрізаному шматку. Сам пошук — шматками по 12 мс: головний потік вільний, і iOS
   // не має за що вбивати сторінку, навіть якщо пошук триватиме кілька секунд.
-  const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
-  const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
-  const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
-  let r = null; const t0 = performance.now(); let tries = 0;
   S.routing = true;
   stage('route:search');
+  const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
+  stage('route:from');
+  const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
+  stage('route:to=' + tos.length);
+  const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
+  let r = null; const t0 = performance.now(); let tries = 0;
   toast('Шукаю маршрут…', 9000);
   try {
     for (const to of tos) {
-      if (isIsolated(g, to)) continue;
+      if (isIsolated(g, to)) { stage('route:iso-skip'); continue; }
+      stage('route:iso-ok');
       tries++;
+      let slices = 0;
       r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000 },
-        (p) => toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000));
+        (p) => { if (++slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5'); toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000); });
+      stage('route:async-done');
       if (r) break;
       if (performance.now() - t0 > 7000) break;
     }
