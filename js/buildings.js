@@ -94,6 +94,8 @@ export class Buildings {
     // відокремити номер: останній токен із цифрою
     const toks = q.split(' ').filter(Boolean);
     let num = '', streetQ = q;
+    // «18 Б» → «18б»: окрема літера після номера належить номеру
+    if (toks.length > 2 && /^\p{L}$/u.test(toks[toks.length - 1]) && /\d/.test(toks[toks.length - 2])) { const l = toks.pop(); toks[toks.length - 1] += l; }
     if (toks.length > 1 && /\d/.test(toks[toks.length - 1])) { num = toks.pop(); streetQ = toks.join(' '); }
     const streetToks = streetQ.split(' ').filter(t => t.length > 1);
     if (!streetToks.length) return [];
@@ -127,7 +129,12 @@ export function normStreet(s) {
   t = t.replace(/[^\p{L}\p{N}]+/gu, ' ');
   return t.split(' ').filter(w => w && !TYPE.has(w)).join(' ').trim();
 }
-function normNum(n) { return (n || '').toLowerCase().replace(/\s+/g, '').replace(/[’'`ʼ]/g, ''); }
+// У даних номер буває «18-Б», «18Б», «18 б», а інколи з латинською літерою («20-E»).
+// Прибираємо пробіли й дефіси та зводимо латинські двійники до кирилиці.
+const LAT = { a: 'а', b: 'в', c: 'с', e: 'е', h: 'н', i: 'і', k: 'к', m: 'м', o: 'о', p: 'р', t: 'т', x: 'х' };
+function normNum(n) {
+  return (n || '').toLowerCase().replace(/[\s\-–—’'`ʼ]+/g, '').replace(/[a-z]/g, (ch) => LAT[ch] || ch);
+}
 export function shortStreet(s) {
   const map = [['вулиця', 'вул.'], ['проспект', 'просп.'], ['провулок', 'пров.'], ['бульвар', 'бул.'], ['площа', 'пл.'], ['набережна', 'наб.']];
   for (const [full, short] of map) {

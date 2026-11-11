@@ -53,6 +53,12 @@
   .tabs { display:flex; gap:6px; margin:8px 0; }
   .tabs button { flex:1; padding:8px; font-size:14px; }
   .tabs button.on { background:var(--accent); color:#06111f; font-weight:600; border-color:transparent; }
+  #sheetSearch { top:0; bottom:auto; border-radius:0 0 18px 18px; padding-top:calc(env(safe-area-inset-top) + 12px); padding-bottom:12px; max-height:calc(100% - 4px); overflow-y:auto; -webkit-overflow-scrolling:touch; z-index:30; }
+  .pincard { position:fixed; left:12px; right:12px; bottom:calc(env(safe-area-inset-bottom) + 76px); background:var(--panel); border-radius:16px; padding:10px 12px; display:none; gap:8px; align-items:center; box-shadow:0 4px 18px rgba(0,0,0,.4); z-index:20; }
+  .pincard.show { display:flex; }
+  .pincard .pn { flex:1; font-size:15px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pincard button { flex:none; padding:10px 14px; }
+  body.haspin .rail { bottom:calc(env(safe-area-inset-bottom) + 140px); }
   .toast { position:fixed; left:50%; bottom:120px; transform:translateX(-50%); background:var(--panel); padding:10px 14px; border-radius:12px; font-size:14px; display:none; }
   .toast.show { display:block; }
 </style>
@@ -79,6 +85,8 @@
   <button id="btnHere">📍 Я тут</button>
   <button id="btnMore">⋯</button>
 </div>
+
+<div class="pincard" id="pinCard"><div class="pn" id="pinName"></div><button id="pinGo" class="primary">🚗 Їхати</button><button id="pinX" aria-label="Прибрати шпильку">✕</button></div>
 
 <div class="sheet" id="sheetSearch">
   <button class="close" data-close="sheetSearch">✕</button>
@@ -110,7 +118,7 @@
   <div class="row"><div class="name">Автозапис поїздок<small id="recInfo">щоб підлаштувати алгоритм під ваше авто</small></div><button id="btnAutoRec">Увімк/вимк</button></div>
   <div class="row"><div class="name">Зберегти лог поїздки<small>файл для розбору на комп'ютері</small></div><button id="btnRec">Зберегти</button></div>
   <div class="row"><div class="name">Дані карти</div><div id="dataInfo" style="color:var(--muted);font-size:13px"></div></div>
-  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.8.12</div></div>
+  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.8.13</div></div>
 </div>
 
 <div class="rail">

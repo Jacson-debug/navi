@@ -165,13 +165,16 @@ function resize() {
 }
 addEventListener('resize', resize);
 
+// Азимут (за годинниковою стрілкою від півночі), який дивиться вгору екрана:
+// курс авто в режимі «за курсом», інакше — те, що задали двома пальцями (0 = північ).
+function viewAngle() { const v = S.view; return (v.rotate && S.engine?.state.xy) ? S.engine.state.heading : (v.rot || 0); }
 function worldToScreen(x, y) {
   const v = S.view, w = canvas.width, h = canvas.height;
   let dx = (x - v.cx) * v.scale * DPR, dy = -(y - v.cy) * v.scale * DPR;
-  if (v.rotate && S.engine?.state.xy) {
-    const a = S.engine.state.heading; // повертаємо так, щоб курс дивився вгору
-    const c = Math.cos(a), s = Math.sin(a);
-    const rx = dx * c - dy * s, ry = dx * s + dy * c;
+  const a = viewAngle();
+  if (a) {
+    const c = Math.cos(a), s = Math.sin(a);   // обертаємо проти годинникової на a: азимут a опиняється вгорі
+    const rx = dx * c + dy * s, ry = -dx * s + dy * c;
     dx = rx; dy = ry;
   }
   return [w / 2 + dx, h * (v.rotate ? PUCK_Y : 0.5) + dy];
@@ -179,8 +182,8 @@ function worldToScreen(x, y) {
 function screenToWorld(sx, sy) {
   const v = S.view, w = canvas.width, h = canvas.height;
   let dx = sx * DPR - w / 2, dy = sy * DPR - h * (v.rotate ? PUCK_Y : 0.5);
-  if (v.rotate && S.engine?.state.xy) {
-    const a = -S.engine.state.heading;
+  const a = viewAngle();
+  if (a) {
     const c = Math.cos(a), s = Math.sin(a);
     const rx = dx * c - dy * s, ry = dx * s + dy * c;
     dx = rx; dy = ry;
@@ -344,6 +347,17 @@ function draw() {
     const p = worldToScreen(S.target.x, S.target.y);
     ctx.strokeStyle = '#4da3ff'; ctx.fillStyle = 'rgba(77,163,255,.25)'; ctx.lineWidth = 2 * DPR; ctx.beginPath(); ctx.arc(p[0], p[1], 9 * DPR, 0, 7); ctx.fill(); ctx.stroke();
   }
+  // шпилька «їхати сюди»
+  if (S.pin) {
+    const p = worldToScreen(S.pin.x, S.pin.y);
+    ctx.save(); ctx.translate(p[0], p[1]);
+    ctx.fillStyle = '#ff4d4d'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2 * DPR;
+    ctx.beginPath(); ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(-15 * DPR, -18 * DPR, -15 * DPR, -42 * DPR, 0, -42 * DPR);
+    ctx.bezierCurveTo(15 * DPR, -42 * DPR, 15 * DPR, -18 * DPR, 0, 0); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(0, -28 * DPR, 5.5 * DPR, 0, 7); ctx.fill();
+    ctx.restore();
+  }
   // частинки
   const eng = S.engine;
   if (eng && S.showParticles) {
@@ -409,30 +423,84 @@ const clampScale = (v) => Math.max(0.0012, Math.min(14, v));
 // Де на екрані стоїть машинка в режимі «за курсом»: нижче центру, щоб уперед
 // було видно більше дороги, ніж позаду.
 const PUCK_Y = 0.74;
-let gesture = null;
-canvas.addEventListener('pointerdown', (e) => { canvas.setPointerCapture(e.pointerId); gesture = gesture || { pts: new Map(), moved: false }; gesture.pts.set(e.pointerId, [e.clientX, e.clientY]); gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; });
+let gesture = null, lpTimer = 0;
+const angDiff = (d) => { while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+canvas.addEventListener('pointerdown', (e) => {
+  try { canvas.setPointerCapture(e.pointerId); } catch { }
+  gesture = gesture || { pts: new Map(), moved: false };
+  gesture.pts.set(e.pointerId, [e.clientX, e.clientY]);
+  gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view };
+  gesture.startRot = S.view.rot || 0; gesture.rotOn = false;
+  clearTimeout(lpTimer);
+  // довге натискання — ставимо шпильку «сюди їхати»
+  if (gesture.pts.size === 1) {
+    lpTimer = setTimeout(() => {
+      if (gesture && !gesture.moved && gesture.pts.size === 1) {
+        gesture.consumed = true;
+        const [x, y] = [...gesture.pts.values()][0];
+        setPin(screenToWorld(x, y));
+      }
+    }, 480);
+  }
+});
 canvas.addEventListener('pointermove', (e) => {
   if (!gesture || !gesture.pts.has(e.pointerId)) return;
   gesture.pts.set(e.pointerId, [e.clientX, e.clientY]);
   const pts = [...gesture.pts.values()];
   if (pts.length === 1) {
     const dx = pts[0][0] - gesture.start[0][0], dy = pts[0][1] - gesture.start[0][1];
-    if (Math.hypot(dx, dy) > 4) gesture.moved = true;
-    if (gesture.moved) { S.follow = false; const a = S.view.rotate && S.engine?.state.xy ? -S.engine.state.heading : 0; const c = Math.cos(a), s = Math.sin(a); const rx = dx * c - dy * s, ry = dx * s + dy * c; S.view.cx = gesture.startView.cx - rx / S.view.scale; S.view.cy = gesture.startView.cy + ry / S.view.scale; }
+    if (Math.hypot(dx, dy) > 6) { gesture.moved = true; clearTimeout(lpTimer); }
+    if (gesture.moved) {
+      S.follow = false;
+      const a = viewAngle(), c = Math.cos(a), s = Math.sin(a);
+      const rx = dx * c - dy * s, ry = dx * s + dy * c;
+      S.view.cx = gesture.startView.cx - rx / S.view.scale; S.view.cy = gesture.startView.cy + ry / S.view.scale;
+    }
   } else if (pts.length >= 2 && gesture.start.length >= 2) {
+    clearTimeout(lpTimer);
     const d0 = Math.hypot(gesture.start[0][0] - gesture.start[1][0], gesture.start[0][1] - gesture.start[1][1]);
     const d1 = Math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1]);
     S.view.scale = clampScale(gesture.startView.scale * d1 / Math.max(1, d0)); gesture.moved = true; S.lastManualZoom = Date.now();
+    // поворот двома пальцями, як у Google Maps: невеликі посмикування ігноруємо (~8°)
+    const a0 = Math.atan2(gesture.start[1][1] - gesture.start[0][1], gesture.start[1][0] - gesture.start[0][0]);
+    const a1 = Math.atan2(pts[1][1] - pts[0][1], pts[1][0] - pts[0][0]);
+    const dphi = angDiff(a1 - a0);
+    if (!gesture.rotOn && Math.abs(dphi) > 0.14) {
+      gesture.rotOn = true;
+      if (S.view.rotate) { gesture.startRot = S.engine?.state.heading || 0; S.view.rot = gesture.startRot; S.view.rotate = false; }
+    }
+    if (gesture.rotOn) { S.view.rot = gesture.startRot - dphi; refreshOrientBtn(); }
   }
   draw();
 });
 const endGesture = (e) => {
+  clearTimeout(lpTimer);
   if (!gesture) return;
-  if (!gesture.moved && gesture.pts.size === 1) onTap(e.clientX, e.clientY);
-  gesture.pts.delete(e.pointerId); if (!gesture.pts.size) gesture = null; else { gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; gesture.moved = true; }
+  if (!gesture.moved && !gesture.consumed && gesture.pts.size === 1) onTap(e.clientX, e.clientY);
+  gesture.pts.delete(e.pointerId);
+  if (!gesture.pts.size) gesture = null;
+  else { gesture.start = [...gesture.pts.values()]; gesture.startView = { ...S.view }; gesture.startRot = S.view.rot || 0; gesture.rotOn = false; gesture.moved = true; }
 };
 canvas.addEventListener('pointerup', endGesture); canvas.addEventListener('pointercancel', endGesture);
 canvas.addEventListener('wheel', (e) => { e.preventDefault(); S.view.scale = clampScale(S.view.scale * (e.deltaY < 0 ? 1.15 : 0.87)); S.lastManualZoom = Date.now(); draw(); }, { passive: false });
+
+function setPin(p) {
+  const bi = S.bld ? S.bld.nearest(p, 50) : -1;
+  const name = bi >= 0 ? S.bld.label(bi) : 'Точка на карті';
+  S.pin = { kind: 'pin', name, x: p[0], y: p[1] };
+  $('pinName').textContent = '📍 ' + name;
+  $('pinCard').classList.add('show'); document.body.classList.add('haspin');
+  try { navigator.vibrate?.(20); } catch { }
+  draw();
+}
+function clearPin() { S.pin = null; $('pinCard').classList.remove('show'); document.body.classList.remove('haspin'); draw(); }
+$('pinX').addEventListener('click', clearPin);
+$('pinGo').addEventListener('click', () => {
+  if (!S.pin) return;
+  const item = { ...S.pin };
+  $('pinCard').classList.remove('show'); document.body.classList.remove('haspin');
+  S.target = item; recentAdd(item); routeTo(item);
+});
 
 function onTap(sx, sy) {
   const p = screenToWorld(sx, sy);
@@ -596,7 +664,7 @@ function updateTurn() {
   }
   if (d < 30 && turnKey === 'end') {
     toast('Ви на місці'); S.voice?.say('Ви прибули', 'arrive', 0);
-    S.routeInfo = null; S.target = null; el.classList.remove('show');
+    S.routeInfo = null; S.target = null; S.pin = null; el.classList.remove('show');
   }
 }
 
@@ -832,8 +900,16 @@ function recentAdd(item) {
   try { localStorage.setItem('navi.recent', JSON.stringify(list.slice(0, 8))); } catch { }
 }
 
+// Клавіатура iOS закриває нижню частину екрана. Тому пошук стоїть ЗВЕРХУ і підлаштовується
+// під видиму область (visualViewport), щоб рядок вводу завжди було видно.
+function fitSearch() {
+  const sh = $('sheetSearch'); if (!sh.classList.contains('show')) return;
+  const vv = window.visualViewport; if (!vv) return;
+  sh.style.top = vv.offsetTop + 'px'; sh.style.maxHeight = (vv.height - 4) + 'px';
+}
+if (window.visualViewport) { visualViewport.addEventListener('resize', fitSearch); visualViewport.addEventListener('scroll', fitSearch); }
 function openSearch() {
-  $('sheetSearch').classList.add('show');
+  $('sheetSearch').classList.add('show'); fitSearch(); setTimeout(fitSearch, 300); setTimeout(fitSearch, 700);
   $('addrInput').value = '';
   renderSearch();
   setTimeout(() => $('addrInput').focus(), 50);
@@ -901,17 +977,28 @@ function renderSearch() {
 $('btnMore').addEventListener('click', () => $('sheetMore').classList.add('show'));
 $('btnFlip').addEventListener('click', () => { S.engine.flipTurns(); toast('Знак поворотів перемкнено'); });
 $('btnParticles').addEventListener('click', () => { S.showParticles = !S.showParticles; toast(S.showParticles ? 'Гіпотези показано' : 'Гіпотези сховано'); draw(); });
+function refreshOrientBtn() {
+  const b = $('btnOrient'), v = S.view; if (!b) return;
+  const turned = !v.rotate && Math.abs(v.rot || 0) > 0.02;
+  b.textContent = v.rotate ? '⬆︎ Курс' : turned ? '🧭 Північ' : '⬆︎ Пн';
+  b.classList.toggle('on', v.rotate || turned);
+}
 function setOrient(rotate, say = true) {
   S.view.rotate = rotate;
+  if (rotate) S.view.rot = 0;
   const b = $('btnOrient');
-  if (b) { b.textContent = rotate ? '⬆︎ Курс' : '⬆︎ Пн'; b.classList.toggle('on', rotate); }
+  refreshOrientBtn();
   const r = $('btnRotate'); if (r) r.textContent = rotate ? 'Карта за курсом' : 'Карта на північ';
   if (say) toast(rotate ? 'Карта крутиться за курсом' : 'Карта зафіксована на північ');
   try { localStorage.setItem('navi.rotate', rotate ? '1' : '0'); } catch (e) {}
   draw();
 }
 $('btnRotate').addEventListener('click', () => setOrient(!S.view.rotate));
-$('btnOrient').addEventListener('click', () => setOrient(!S.view.rotate));
+$('btnOrient').addEventListener('click', () => {
+  // карту повернули пальцями — перший дотик повертає північ угору, другий вмикає «за курсом»
+  if (!S.view.rotate && Math.abs(S.view.rot || 0) > 0.02) { S.view.rot = 0; refreshOrientBtn(); toast('Північ угорі'); draw(); return; }
+  setOrient(!S.view.rotate);
+});
 // Рух із курсом угору — основний режим навігації, тому він типовий.
 try {
   if (localStorage.getItem('navi.orientDefault') !== '1') { localStorage.setItem('navi.orientDefault', '1'); localStorage.setItem('navi.rotate', '1'); }
