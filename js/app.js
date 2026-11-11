@@ -94,6 +94,8 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 const canvas = $('map'), ctx = canvas.getContext('2d');
 const DPR = Math.min(2, window.devicePixelRatio || 1);
 const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+// «Холодний» пошук маршруту (без оптимізації JIT): на iPhone інакше Safari падає. ?cold=1 — примусово.
+const COLD = IS_IOS || /[?&]cold=1/.test(location.search);
 
 // ---------- стан ----------
 const S = {
@@ -582,7 +584,7 @@ async function routeTo(f) {
       tries++;
       let slices = 0, lastToast = 0;
       try { localStorage.removeItem('navi.ast'); } catch { }
-      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000, onStage: (m) => stage('astar:' + m),
+      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 9000, cold: COLD, onStage: (m) => stage('astar:' + m),
           // лічильники пишемо ДО кожного кроку: після падіння в журналі видно, на чому обірвалось
           trace: (ex, hp, st) => { try { localStorage.setItem('navi.ast', `крок ${st}, розкрито ${ex}, купа ${hp}`); } catch { } } },
         (p) => { slices++; if (slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5');
@@ -637,7 +639,7 @@ function updateTurn() {
       S.rebuildAt = st.edge.id; S.rebuildT = Date.now();
       const to = S.routeInfo ? S.routeInfo.nodes[S.routeInfo.nodes.length - 1] : g.nearestNode([S.target.x, S.target.y]);
       S.routing = true;
-      routeAsync(g, st.edge.b, to, speedByIdFrom(g, S.traffic, TrafficMemory.slot()), VMAX, { maxExpand: 150000, timeoutMs: 5000 })
+      routeAsync(g, st.edge.b, to, speedByIdFrom(g, S.traffic, TrafficMemory.slot()), VMAX, { maxExpand: 150000, timeoutMs: 5000, cold: COLD })
         .then(r => { if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; toast('Перебудовую маршрут'); } })
         .catch(e => logErr('rebuild: ' + e.message))
         .finally(() => { S.routing = false; });
@@ -1116,6 +1118,7 @@ function updateTrailInfo() {
     'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
     'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
     'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
+    'пошук: ' + (COLD ? 'холодний' : 'звичайний'),
     'економія пам\'яті: ' + (ECO() ? 'так' : 'ні'),
     localStorage.getItem('navi.memtest') ? `тест пам'яті: ${localStorage.getItem('navi.memtest')}` : null,
     performance.memory ? `пам'ять JS: ${Math.round(performance.memory.usedJSHeapSize / 1048576)} МБ` : null,

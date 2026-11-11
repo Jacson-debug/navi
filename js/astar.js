@@ -89,7 +89,7 @@ function _prepare(graph, fromNode, toNode, speedById, vmax, maxExpand) {
   if (speedById) { if (speedById.ff) { mode = 1; ov = speedById.ov || null; } else { mode = 2; custom = speedById; } }
   S.stamp[fromNode] = gen; S.g[fromNode] = 0; S.prev[fromNode] = -1;
   S.heap.push(h(fromNode), fromNode);
-  return { S, gen, h, mode, ov, custom, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
+  return { S, gen, h, mode, ov, custom, hdiv, gx, gy, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
 }
 
 // Виконує до `budget` розкриттів. Повертає true, коли пошук завершено.
@@ -123,6 +123,54 @@ function _step(st, budget) {
     if (++n >= budget) return false;
   }
   return true;
+}
+
+// «Холодний» крок. На iPhone Safari гарантовано падає, щойно JIT-компілятор оптимізує гарячий
+// цикл пошуку (щоразу після ~3000 розкритих вузлів, без жодної помилки JS). Тому тут цикл
+// створюється заново (new Function) на кожні ~200 вузлів: лічильники «гарячості» щоразу з нуля,
+// код лишається в інтерпретаторі/базовому JIT і до оптимізатора не доходить. Купа вбудована в цикл.
+const COLD_SRC = `
+const S = st.S, g = S.g, prev = S.prev, stamp = S.stamp, closed = S.closed, heap = S.heap;
+let hk = heap.k, hv = heap.v, hn = heap.n;
+const graph = st.graph, len = graph.len, B = graph.b, outOff = graph.outOff, outList = graph.outList;
+const X = graph.nodeX, Y = graph.nodeY, cls = graph.cls, FF = FREEFLOW;
+const gen = st.gen, toNode = st.toNode, mode = st.mode, ov = st.ov, custom = st.custom, hdiv = st.hdiv, gx = st.gx, gy = st.gy, maxExpand = st.maxExpand;
+let expanded = st.expanded, bestH = st.bestH, n = 0, done = true;
+while (hn > 0) {
+  const u = hv[0]; hn--;
+  if (hn > 0) {
+    const key = hk[hn], val = hv[hn]; let i = 0;
+    for (;;) { let l = 2 * i + 1; if (l >= hn) break; const r = l + 1; if (r < hn && hk[r] < hk[l]) l = r; if (hk[l] >= key) break; hk[i] = hk[l]; hv[i] = hv[l]; i = l; }
+    hk[i] = key; hv[i] = val;
+  }
+  if (u === toNode) { st.found = true; break; }
+  if (closed[u] === gen) continue;
+  closed[u] = gen;
+  if (++expanded > maxExpand) { st.capped = true; break; }
+  const gu = g[u];
+  for (let k = outOff[u], end = outOff[u + 1]; k < end; k++) {
+    const eid = outList[k], nb = B[eid];
+    if (closed[nb] === gen) continue;
+    let sp = 1;
+    if (mode === 1) { sp = FF[cls[eid]]; if (ov !== null) { const v = ov.get(eid); if (v !== undefined) sp = v; } }
+    else if (mode === 2) sp = Math.max(0.3, custom(eid));
+    const ng = mode === 0 ? gu + len[eid] : gu + len[eid] / sp;
+    if (stamp[nb] !== gen || ng < g[nb]) {
+      stamp[nb] = gen; g[nb] = ng; prev[nb] = eid;
+      const dx = X[nb] - gx, dy = Y[nb] - gy, hh = Math.sqrt(dx * dx + dy * dy) / hdiv;
+      if (hh < bestH) bestH = hh;
+      if (hn >= hk.length) { const nk = new Float64Array(hk.length * 2), nv = new Int32Array(hv.length * 2); nk.set(hk); nv.set(hv); hk = nk; hv = nv; }
+      const pk = ng + hh; let i = hn++;
+      while (i > 0) { const p = (i - 1) >> 1; if (hk[p] <= pk) break; hk[i] = hk[p]; hv[i] = hv[p]; i = p; }
+      hk[i] = pk; hv[i] = nb;
+    }
+  }
+  if (++n >= budget) { done = false; break; }
+}
+heap.k = hk; heap.v = hv; heap.n = hn; st.expanded = expanded; st.bestH = bestH;
+return done;`;
+function _stepCold(st, budget) {
+  return new Function('st', 'budget', 'FREEFLOW', COLD_SRC)(st, budget, FREEFLOW_BY_CLS);
 }
 
 function _finish(st) {
@@ -164,12 +212,12 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
   mark('prep-ok');
   const sliceMs = opts.sliceMs ?? 12, t0 = performance.now(), timeoutMs = opts.timeoutMs ?? 8000;
   let done = false, first = true, steps = 0;
-  const trace = opts.trace || null;
+  const trace = opts.trace || null, cold = !!opts.cold;
   while (!done) {
     const ts = performance.now();
     while (!done && performance.now() - ts < sliceMs) {
       if (trace && (++steps <= 12 || (steps & 3) === 0)) trace(st.expanded, st.S.heap.n, steps);
-      done = _step(st, first ? 50 : 1000);
+      done = cold ? _stepCold(st, first ? 50 : 200) : _step(st, first ? 50 : 1000);
       if (first) { first = false; mark('step1-ok'); }
     }
     if (done) break;
