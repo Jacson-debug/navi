@@ -50,6 +50,14 @@ function leaveSafeMode() { try { localStorage.setItem(CRASH_KEY, '0'); localStor
 function markOk() { stage('ok'); try { localStorage.setItem(CRASH_KEY, '0'); } catch (e) {} }
 window.NAVI_SAFE = SAFE;
 stage('boot');
+// Якщо минулий пошук маршруту вбив сторінку — вмикаємо «економію пам'яті» (вона лишається, доки
+// її не вимкнуть у меню) і не враховуємо пробки. Прапорець ставиться на час пошуку й знімається після.
+try {
+  if (localStorage.getItem('navi.routing') === '1') {
+    localStorage.setItem('navi.eco', '1'); localStorage.removeItem('navi.routing'); window.NAVI_NO_TRAFFIC = true;
+  }
+} catch { }
+const ECO = () => { try { return localStorage.getItem('navi.eco') === '1'; } catch { return false; } };
 
 // ---------- примусове оновлення коду ----------
 // Service worker може «залипнути» на старій версії. Тому: (1) ?reset=1 зносить усі
@@ -554,15 +562,14 @@ async function routeTo(f) {
   // не має за що вбивати сторінку, навіть якщо пошук триватиме кілька секунд.
   S.routing = true;
   stage('route:search');
+  // Економія пам'яті: на час маршруту вивантажуємо будинки (~50 МБ) — це дає запас пошуку
+  if (ECO() && S.bld) { S.bld = null; stage('route:eco-free'); toast('Звільняю пам\'ять…', 4000); await new Promise(r => setTimeout(r, 200)); }
   const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
   stage('route:from');
   const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
   stage('route:to=' + tos.length);
   // Страховка: якщо минулий маршрут убив сторінку — цього разу пробки не враховуємо.
-  try {
-    if (localStorage.getItem('navi.routing') === '1') { window.NAVI_NO_TRAFFIC = true; stage('route:no-traffic'); }
-    localStorage.setItem('navi.routing', '1');
-  } catch { }
+  try { localStorage.setItem('navi.routing', '1'); } catch { }
   stage('route:speed');
   const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
   stage('route:speed-ok');
@@ -669,6 +676,7 @@ function updateTurn() {
   if (d < 30 && turnKey === 'end') {
     toast('Ви на місці'); S.voice?.say('Ви прибули', 'arrive', 0);
     S.routeInfo = null; S.target = null; S.pin = null; el.classList.remove('show');
+    if (ECO() && !S.bld && !S.bldLoading) setTimeout(() => loadBuildings(), 1500);
   }
 }
 
@@ -913,6 +921,10 @@ function fitSearch() {
 }
 if (window.visualViewport) { visualViewport.addEventListener('resize', fitSearch); visualViewport.addEventListener('scroll', fitSearch); }
 function openSearch() {
+  if (!S.bld && !S.bldLoading) {
+    if (S.routeInfo) toast('Адреси вимкнено на час маршруту (економія пам\'яті). АЗС шукати можна.', 5000);
+    else loadBuildings();
+  }
   $('sheetSearch').classList.add('show'); fitSearch(); setTimeout(fitSearch, 300); setTimeout(fitSearch, 700);
   $('addrInput').value = '';
   renderSearch();
@@ -1104,6 +1116,8 @@ function updateTrailInfo() {
     'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
     'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
     'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
+    'економія пам\'яті: ' + (ECO() ? 'так' : 'ні'),
+    localStorage.getItem('navi.memtest') ? `тест пам'яті: ${localStorage.getItem('navi.memtest')}` : null,
     performance.memory ? `пам'ять JS: ${Math.round(performance.memory.usedJSHeapSize / 1048576)} МБ` : null,
   ].filter(Boolean).join('\n');
   el.textContent = `${$('ver')?.textContent || ''}${sv}${ua ? ' · iOS ' + ua : ''}${SAFE ? ' · безпечний режим' : ''}\n${env}\n`
@@ -1111,6 +1125,25 @@ function updateTrailInfo() {
     + (localStorage.getItem('navi.ast') ? 'останній крок пошуку: ' + localStorage.getItem('navi.ast') + '\n' : '')
     + 'етапи: ' + trail.slice(-12).join(' → ');
 }
+function updateEcoInfo() { const e = $('ecoInfo'); if (e) e.textContent = ECO() ? 'увімкнена: на час маршруту адреси вимкнені, зате пошук не падає' : 'вимкнена'; }
+$('btnEco')?.addEventListener('click', () => { try { localStorage.setItem('navi.eco', ECO() ? '0' : '1'); } catch { } updateEcoInfo(); toast(ECO() ? 'Економію пам\'яті увімкнено' : 'Економію вимкнено'); });
+updateEcoInfo();
+// Тест пам'яті: виділяє по 8 МБ, доки систему не вичерпано. Перед кожним кроком число пишеться
+// в localStorage, тож після перезапуску в журналі видно, скільки телефон дозволив.
+$('btnMem')?.addEventListener('click', async () => {
+  const keep = []; let mb = 0;
+  toast('Тест пам\'яті. Програма може перезапуститись — це нормально, відкрийте журнал', 7000);
+  for (;;) {
+    try { localStorage.setItem('navi.memtest', 'дозволено щонайменше ' + mb + ' МБ понад звичайне'); } catch { }
+    const a = new Uint8Array(8 << 20); a.fill(1); keep.push(a); mb += 8;
+    $('memInfo').textContent = `виділено ${mb} МБ…`;
+    if (mb >= 800) break;
+    await new Promise(r => setTimeout(r, 40));
+  }
+  keep.length = 0;
+  try { localStorage.setItem('navi.memtest', 'витримало 800 МБ без падіння'); } catch { }
+  $('memInfo').textContent = 'витримало 800 МБ'; updateTrailInfo();
+});
 $('btnUpdate')?.addEventListener('click', async () => { toast('Оновлюю код…'); await hardReset(); });
 if ($('safeInfo')) {
   $('safeInfo').textContent = SAFE ? 'увімкнений: без голосу й автозапису' : 'вимкнений — усе працює звичайно';

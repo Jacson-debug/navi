@@ -11,7 +11,8 @@
 // Швидкість за класом дороги (м/с) — для режиму «найшвидший маршрут».
 // Порядок класів як у graph.js: service, living_street, residential, road, unclassified,
 // tertiary, secondary, primary, trunk, motorway
-const FREEFLOW_BY_CLS = new Float32Array([20, 15, 30, 30, 35, 40, 45, 50, 70, 90].map(v => v / 3.6));
+const FREEFLOW_BY_CLS = new Float32Array(16).fill(9);
+FREEFLOW_BY_CLS.set([20, 15, 30, 30, 35, 40, 45, 50, 70, 90].map(v => v / 3.6));
 
 class MinHeap {
   constructor(cap) { this.k = new Float64Array(cap); this.v = new Int32Array(cap); this.n = 0; }
@@ -64,7 +65,6 @@ function scratch(graph) {
     closed: new Int32Array(n),    // Int32, а не Uint32: JavaScriptCore не любить uint32 > 2^31 у гарячому циклі
     gen: 0,
     heap: new MinHeap(1 << 16),
-    base: null, spd: null,        // швидкість за ребром (м/с) — заповнюється при першому маршруті
   });
 }
 
@@ -74,15 +74,6 @@ function scratch(graph) {
  *   opts.maxExpand — стеля розкритих вузлів (типово 300 000).
  * Повертає { nodes, edges, length, time, expanded, capped } або null.
  */
-function ensureSpd(graph, S) {
-  if (!S.spd) {
-    const nE = graph.n, cls = graph.cls;
-    S.spd = new Float32Array(nE); S.base = new Float32Array(nE);
-    for (let e = 0; e < nE; e++) S.base[e] = FREEFLOW_BY_CLS[cls[e]] || 9;
-  }
-  return S.spd;
-}
-
 // Внутрішній крок: спільний для синхронної та покрокової версій.
 function _prepare(graph, fromNode, toNode, speedById, vmax, maxExpand) {
   const S = scratch(graph);
@@ -92,20 +83,19 @@ function _prepare(graph, fromNode, toNode, speedById, vmax, maxExpand) {
   const X = graph.nodeX, Y = graph.nodeY;
   const gx = X[toNode], gy = Y[toNode];
   const hdiv = speedById ? vmax : 1;
-  let spd = null;
-  if (speedById) {
-    if (speedById.arr) spd = speedById.arr;
-    else { spd = ensureSpd(graph, S); for (let e = 0, m = graph.n; e < m; e++) spd[e] = Math.max(0.3, speedById(e)); }
-  }
   const h = (node) => { const dx = X[node] - gx, dy = Y[node] - gy; return Math.sqrt(dx * dx + dy * dy) / hdiv; };
+  // режим швидкості: 0 — найкоротший; 1 — вільна швидкість за класом + Map «пам'яті пробок»; 2 — довільна функція
+  let mode = 0, ov = null, custom = null;
+  if (speedById) { if (speedById.ff) { mode = 1; ov = speedById.ov || null; } else { mode = 2; custom = speedById; } }
   S.stamp[fromNode] = gen; S.g[fromNode] = 0; S.prev[fromNode] = -1;
   S.heap.push(h(fromNode), fromNode);
-  return { S, gen, h, spd, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
+  return { S, gen, h, mode, ov, custom, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
 }
 
 // Виконує до `budget` розкриттів. Повертає true, коли пошук завершено.
 function _step(st, budget) {
-  const { S, gen, h, graph, toNode, spd } = st;
+  const { S, gen, h, graph, toNode, mode, ov, custom } = st;
+  const cls = graph.cls, FF = FREEFLOW_BY_CLS;
   const { g, prev, stamp, closed, heap } = S;
   const len = graph.len, B = graph.b, outOff = graph.outOff, outList = graph.outList;
   let n = 0;
@@ -120,7 +110,10 @@ function _step(st, budget) {
     for (let k = outOff[u], end = outOff[u + 1]; k < end; k++) {
       const eid = outList[k], nb = B[eid];
       if (closed[nb] === gen) continue;
-      const ng = spd !== null ? gu + len[eid] / spd[eid] : gu + len[eid];
+      let sp = 1;
+      if (mode === 1) { sp = FF[cls[eid]]; if (ov !== null) { const v = ov.get(eid); if (v !== undefined) sp = v; } }
+      else if (mode === 2) sp = Math.max(0.3, custom(eid));
+      const ng = mode === 0 ? gu + len[eid] : gu + len[eid] / sp;
       if (stamp[nb] !== gen || ng < g[nb]) {
         stamp[nb] = gen; g[nb] = ng; prev[nb] = eid;
         const hn = h(nb); if (hn < st.bestH) st.bestH = hn;
@@ -133,7 +126,7 @@ function _step(st, budget) {
 }
 
 function _finish(st) {
-  const { S, graph, fromNode, toNode, spd, expanded } = st;
+  const { S, graph, fromNode, toNode, mode, ov, custom, expanded } = st;
   route.lastExpanded = expanded; route.lastCapped = st.capped;
   if (!st.found) return null;
   const len = graph.len, prev = S.prev;
@@ -142,7 +135,10 @@ function _finish(st) {
   while (cur !== fromNode) { const eid = prev[cur]; edges.push(eid); cur = graph.a[eid]; nodes.push(cur); }
   edges.reverse(); nodes.reverse();
   let length = 0, time = 0;
-  for (const eid of edges) { length += len[eid]; time += spd !== null ? len[eid] / spd[eid] : len[eid] / 11; }
+  for (const eid of edges) { length += len[eid]; let sp = 11;
+    if (mode === 1) { sp = FREEFLOW_BY_CLS[graph.cls[eid]]; if (ov !== null) { const v = ov.get(eid); if (v !== undefined) sp = v; } }
+    else if (mode === 2) sp = Math.max(0.3, custom(eid));
+    time += len[eid] / sp; }
   return { nodes, edges, length, time, expanded, capped: false };
 }
 
@@ -186,20 +182,22 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
 
 // Швидкість ребра за id з «пам'яті пробок»: спостереження, якщо є, інакше вільна за класом.
 export function speedByIdFrom(graph, traffic, slot) {
-  // Швидкість кожного ребра — у Float32Array: у гарячому циклі жодних викликів і об'єктів.
-  const S = scratch(graph), arr = ensureSpd(graph, S);
-  arr.set(S.base);
+  // Вільна швидкість — таблицею за класом дороги; спостереження з «пам'яті пробок» — лише
+  // для ребер, де вони є, в Map. Жодних великих масивів на ребро (це десятки МБ на iPhone).
+  let ov = null;
   if (traffic && traffic.hasData && !globalThis.NAVI_NO_TRAFFIC) {
+    ov = new Map();
     const edge = { id: 0 };
     for (const k in traffic.data) {
       edge.id = k;
       const v = traffic.expected(edge, slot);
       const e = +k;
-      if (v !== null && isFinite(v) && e >= 0 && e < graph.n) arr[e] = Math.max(0.3, v);
+      if (v !== null && isFinite(v) && e >= 0 && e < graph.n) ov.set(e, Math.max(0.3, v));
     }
   }
-  const fn = (eid) => arr[eid];
-  fn.arr = arr;
+  const cls = graph.cls;
+  const fn = (eid) => { if (ov !== null) { const v = ov.get(eid); if (v !== undefined) return v; } return FREEFLOW_BY_CLS[cls[eid]]; };
+  fn.ff = true; fn.ov = ov;
   return fn;
 }
 
