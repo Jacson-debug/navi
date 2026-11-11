@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="uk"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Наві · діагностика пошуку</title>
+<style>
+ body{margin:0;background:#0b0f14;color:#e8eef6;font:16px -apple-system,system-ui,sans-serif;padding:calc(env(safe-area-inset-top) + 14px) 14px 40px}
+ h1{font-size:20px;margin:0 0 6px} p{color:#9fb0c3;margin:6px 0 12px;line-height:1.35}
+ button{font:inherit;color:#e8eef6;background:#16202c;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px 16px;margin:0 8px 8px 0}
+ button.primary{background:#4da3ff;color:#06111f;font-weight:700;border-color:transparent}
+ .t{display:flex;gap:10px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.07)} .t b{flex:1;font-weight:500} .t span{flex:none;text-align:right;max-width:55%}
+ .ok{color:#3ddc84}.bad{color:#ff5d5d}.run{color:#ffb020}.wait{color:#8394a8}
+ pre{white-space:pre-wrap;word-break:break-word;background:#111a24;border-radius:12px;padding:10px;font-size:13px}
+</style></head><body>
+<h1>Діагностика пошуку маршруту</h1>
+<p>Кожен тест запускається окремо. Якщо Safari падає — сторінка сама перезапуститься, запам'ятає, на якому тесті впало, і піде далі. Після двох падінь поспіль зупиниться: тоді натисніть «Продовжити».</p>
+<div><button class="primary" id="go">Старт</button><button id="reset">Скинути</button><button id="copy">Копіювати результат</button></div>
+<div id="list"></div>
+<pre id="log"></pre>
+<script type="module">
+const KEY = 'navi.diag';
+const $ = (id) => document.getElementById(id);
+const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || { res: {}, running: null, crashes: 0, auto: false }; } catch { return { res: {}, running: null, crashes: 0, auto: false }; } };
+const save = (st) => { try { localStorage.setItem(KEY, JSON.stringify(st)); } catch { } };
+let st = load();
+const fresh = '?fresh=' + Date.now();
+let RoadGraph, A, g = null, ver = '?';
+try {
+  ({ RoadGraph } = await import('./js/graph.js' + fresh));
+  A = await import('./js/astar.js' + fresh);
+  ver = A.ASTAR_VERSION || 'стара (<0.8.18)';
+} catch (e) { $('log').textContent = 'Не вдалося завантажити модулі: ' + e.message; }
+
+async function ensureG() {
+  if (g) return g;
+  const r = await fetch('data/graph.bin'); const b = await r.arrayBuffer();
+  g = RoadGraph.fromBinary(b); return g;
+}
+const nodeA = () => g.nearestNode([0, 0]), nodeB = () => g.nearestNode([3000, 2000]), nodeF = () => g.nearestNode([-30000, 20000]);
+
+const tests = [
+  { id: 'load', name: '1. Завантаження графа', run: async () => { await ensureG(); return g.nNodes + ' вузлів'; } },
+  { id: 'heap', name: '2. Купа (20 000 вставок і вилучень)', run: async () => {
+      const N = 20000, k = new Float64Array(N + 1), v = new Int32Array(N + 1); let n = 0;
+      const push = (key, val) => { let i = n++; while (i > 0) { const p = (i - 1) >> 1; if (k[p] <= key) break; k[i] = k[p]; v[i] = v[p]; i = p; } k[i] = key; v[i] = val; };
+      const pop = () => { const top = v[0]; n--; if (n > 0) { const key = k[n], val = v[n]; let i = 0; for (;;) { let l = 2 * i + 1; if (l >= n) break; const r = l + 1; if (r < n && k[r] < k[l]) l = r; if (k[l] >= key) break; k[i] = k[l]; v[i] = v[l]; i = l; } k[i] = key; v[i] = val; } return top; };
+      let x = 12345; for (let i = 0; i < N; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; push(x / 1000, i); }
+      let last = -1, bad = 0; for (let i = 0; i < N; i++) { const t = pop(); if (t < 0) bad++; last = t; }
+      return bad ? 'ПОМИЛКА порядку' : 'добре'; } },
+  { id: 'walk', name: '3. Обхід графа в ширину (8 000 вузлів)', run: async () => {
+      await ensureG(); const n = g.nNodes, seen = new Uint8Array(n), q = new Int32Array(10000); let h = 0, t = 0, cnt = 0; const s = nodeA(); q[t++] = s; seen[s] = 1;
+      while (h < t && cnt < 8000) { const u = q[h++]; cnt++; for (let e = g.outOff[u]; e < g.outOff[u + 1]; e++) { const nb = g.b[g.outList[e]]; if (!seen[nb] && t < 10000) { seen[nb] = 1; q[t++] = nb; } } }
+      return cnt + ' вузлів'; } },
+  { id: 'route-hot-6k', name: '4. Пошук, звичайний цикл, до 6 000 вузлів', run: async () => {
+      await ensureG(); const sp = A.speedByIdFrom(g, null, 0); const t0 = performance.now(); const r = A.route(g, nodeA(), nodeB(), sp, 25, { maxExpand: 6000 });
+      return 'розкрито ' + A.route.lastExpanded + ', ' + Math.round(performance.now() - t0) + ' мс'; } },
+  { id: 'route-cold', name: '5. Пошук, «холодний» цикл, до 6 000 вузлів', run: async () => {
+      await ensureG(); const sp = A.speedByIdFrom(g, null, 0); const t0 = performance.now();
+      const r = await A.routeAsync(g, nodeA(), nodeB(), sp, 25, { cold: true, maxExpand: 6000, trace: (e, h, s) => { try { localStorage.setItem('navi.diag.ast', `крок ${s}, розкрито ${e}`); } catch { } } });
+      return 'розкрито ' + A.route.lastExpanded + ', ' + Math.round(performance.now() - t0) + ' мс'; } },
+  { id: 'route-hot-full', name: '6. Повний пошук до Гонгадзе, звичайний цикл', run: async () => {
+      await ensureG(); const sp = A.speedByIdFrom(g, null, 0); const t0 = performance.now(); const r = A.route(g, nodeA(), nodeB(), sp, 25, {});
+      return (r ? Math.round(r.length) + ' м' : 'не знайдено') + ', розкрито ' + A.route.lastExpanded + ', ' + Math.round(performance.now() - t0) + ' мс'; } },
+  { id: 'route-async', name: '7. Повний пошук частинами по 12 мс (як у програмі)', run: async () => {
+      await ensureG(); const sp = A.speedByIdFrom(g, null, 0); const t0 = performance.now();
+      const r = await A.routeAsync(g, nodeA(), nodeB(), sp, 25, { trace: (e, h, s) => { try { localStorage.setItem('navi.diag.ast', `крок ${s}, розкрито ${e}`); } catch { } } });
+      return (r ? Math.round(r.length) + ' м' : 'не знайдено') + ', ' + Math.round(performance.now() - t0) + ' мс'; } },
+  { id: 'route-far', name: '8. Далекий маршрут (до ~120 000 вузлів)', run: async () => {
+      await ensureG(); const sp = A.speedByIdFrom(g, null, 0); const t0 = performance.now(); const r = A.route(g, nodeA(), nodeF(), sp, 25, {});
+      return (r ? Math.round(r.length) + ' м' : 'не знайдено') + ', розкрито ' + A.route.lastExpanded + ', ' + Math.round(performance.now() - t0) + ' мс'; } },
+];
+
+function render() {
+  $('list').innerHTML = `<div class="t"><b>Версія пошуку</b><span>${ver}</span></div>` + tests.map(t => {
+    const r = st.res[t.id]; const run = st.running === t.id;
+    const cls = !r ? (run ? 'run' : 'wait') : r.startsWith('КРАХ') ? 'bad' : 'ok';
+    return `<div class="t"><b>${t.name}</b><span class="${cls}">${r || (run ? 'виконується…' : 'чекає')}</span></div>`;
+  }).join('');
+  const ast = localStorage.getItem('navi.diag.ast');
+  $('log').textContent = (ast ? 'останній крок пошуку: ' + ast + '\n' : '') + `падінь: ${st.crashes} · ${navigator.userAgent.match(/Version\/[\d.]+/)?.[0] || ''}`;
+}
+function summary() {
+  return `Діагностика Наві · пошук ${ver}\n` + tests.map(t => `${t.name}: ${st.res[t.id] || 'не виконано'}`).join('\n') + `\n${$('log').textContent}`;
+}
+
+async function runAll() {
+  st.auto = true; save(st);
+  for (const t of tests) {
+    if (st.res[t.id]) continue;
+    st.running = t.id; save(st); render();
+    try { localStorage.removeItem('navi.diag.ast'); } catch { }
+    await new Promise(r => setTimeout(r, 60));   // даємо записати стан на диск
+    let out;
+    try { out = 'ок · ' + await t.run(); } catch (e) { out = 'ПОМИЛКА: ' + e.message; }
+    st.res[t.id] = out; st.running = null; st.crashes = 0; save(st); render();
+    await new Promise(r => setTimeout(r, 30));
+  }
+  st.auto = false; save(st); render();
+  $('go').textContent = 'Готово — скопіюйте результат';
+}
+
+// Якщо минулого разу тест не завершився — це було падіння.
+if (st.running) {
+  st.res[st.running] = 'КРАХ (Safari перезапустив сторінку)'; st.running = null; st.crashes = (st.crashes || 0) + 1; save(st);
+}
+render();
+$('go').onclick = () => { st.crashes = 0; runAll(); };
+$('reset').onclick = () => { try { localStorage.removeItem(KEY); localStorage.removeItem('navi.diag.ast'); } catch { } st = load(); render(); $('go').textContent = 'Старт'; };
+$('copy').onclick = async () => { try { await navigator.clipboard.writeText(summary()); $('copy').textContent = 'Скопійовано'; } catch { $('copy').textContent = 'Не вдалося — зробіть знімок екрана'; } };
+if (st.auto && st.crashes < 2 && A) { $('go').textContent = 'Продовжую…'; setTimeout(runAll, 700); }
+else if (st.crashes >= 2) { $('go').textContent = 'Продовжити'; }
+</script></body></html>

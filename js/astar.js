@@ -11,7 +11,8 @@
 // Швидкість за класом дороги (м/с) — для режиму «найшвидший маршрут».
 // Порядок класів як у graph.js: service, living_street, residential, road, unclassified,
 // tertiary, secondary, primary, trunk, motorway
-const FREEFLOW_BY_CLS = new Float32Array(16).fill(9);
+export const ASTAR_VERSION = '0.8.18';
+export const FREEFLOW_BY_CLS = new Float32Array(16).fill(9);
 FREEFLOW_BY_CLS.set([20, 15, 30, 30, 35, 40, 45, 50, 70, 90].map(v => v / 3.6));
 
 class MinHeap {
@@ -229,21 +230,21 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
 }
 
 // Швидкість ребра за id з «пам'яті пробок»: спостереження, якщо є, інакше вільна за класом.
-export function speedByIdFrom(graph, traffic, slot) {
-  // Вільна швидкість — таблицею за класом дороги; спостереження з «пам'яті пробок» — лише
-  // для ребер, де вони є, в Map. Жодних великих масивів на ребро (це десятки МБ на iPhone).
-  let ov = null;
-  if (traffic && traffic.hasData && !globalThis.NAVI_NO_TRAFFIC) {
-    ov = new Map();
-    const edge = { id: 0 };
-    for (const k in traffic.data) {
-      edge.id = k;
-      const v = traffic.expected(edge, slot);
-      const e = +k;
-      if (v !== null && isFinite(v) && e >= 0 && e < graph.n) ov.set(e, Math.max(0.3, v));
-    }
+// Спостереження «пам'яті пробок» → Map ребро → м/с (лише ребра, де дані є) або null.
+export function trafficOverrides(graph, traffic, slot) {
+  if (!traffic || !traffic.hasData || globalThis.NAVI_NO_TRAFFIC) return null;
+  const ov = new Map(), edge = { id: 0 };
+  for (const k in traffic.data) {
+    edge.id = k;
+    const v = traffic.expected(edge, slot), e = +k;
+    if (v !== null && isFinite(v) && e >= 0 && e < graph.n) ov.set(e, Math.max(0.3, v));
   }
-  const cls = graph.cls;
+  return ov.size ? ov : null;
+}
+
+export function speedByIdFrom(graph, traffic, slot) {
+  // Вільна швидкість — таблицею за класом дороги; спостереження — лише для ребер, де вони є, в Map.
+  const ov = trafficOverrides(graph, traffic, slot), cls = graph.cls;
   const fn = (eid) => { if (ov !== null) { const v = ov.get(eid); if (v !== undefined) return v; } return FREEFLOW_BY_CLS[cls[eid]]; };
   fn.ff = true; fn.ov = ov;
   return fn;

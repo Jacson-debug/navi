@@ -7,12 +7,12 @@
 //   DATA  — карта, будинки, АЗС, назви місцевостей: десятки мегабайтів.
 //           Лежить окремо, щоб оновлення коду НЕ змушувало телефон качати їх знову
 //           через мобільний інтернет.
-const SHELL_CACHE = 'navi-shell-v0.8.16';
+const SHELL_CACHE = 'navi-shell-v0.8.18';
 const DATA_CACHE = 'navi-data-v1';
 const KEEP = [SHELL_CACHE, DATA_CACHE];
 const SHELL = ['./', './index.html', './manifest.webmanifest', './keep.mp4',
   './js/app.js', './js/engine.js', './js/motion.js', './js/filter.js', './js/graph.js',
-  './js/astar.js', './js/geo.js', './js/traffic.js', './js/buildings.js', './js/voice.js',
+  './js/astar.js', './js/wasm-route.js', './js/wasm-bin.js', './js/geo.js', './js/traffic.js', './js/buildings.js', './js/voice.js',
   './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 // Кожен файл окремо: якщо один не завантажився, решта все одно в кеші й нова
@@ -38,6 +38,8 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== location.origin) return;
+  // діагностика й запити з ?fresh= — завжди з мережі, повз кеш
+  if (url.searchParams.has('fresh') || url.pathname.endsWith('/diag.html')) return;
 
   e.respondWith((async () => {
     if (url.pathname.includes('/data/')) {

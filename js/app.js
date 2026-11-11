@@ -1,7 +1,8 @@
 // Наві — застосунок. Карта на canvas, датчики, GPS, АЗС зі статусами, маршрут, демо.
 import { RoadGraph } from './graph.js';
 import { NavEngine } from './engine.js';
-import { route, routeAsync, instructions, speedByIdFrom, prepareRouting } from './astar.js';
+import { route, routeAsync, instructions, speedByIdFrom, trafficOverrides, prepareRouting } from './astar.js';
+import { createWasmRouter, wasmSupported } from './wasm-route.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
 import { Buildings, normStreet, shortStreet } from './buildings.js';
@@ -50,14 +51,19 @@ function leaveSafeMode() { try { localStorage.setItem(CRASH_KEY, '0'); localStor
 function markOk() { stage('ok'); try { localStorage.setItem(CRASH_KEY, '0'); } catch (e) {} }
 window.NAVI_SAFE = SAFE;
 stage('boot');
-// Якщо минулий пошук маршруту вбив сторінку — вмикаємо «економію пам'яті» (вона лишається, доки
-// її не вимкнуть у меню) і не враховуємо пробки. Прапорець ставиться на час пошуку й знімається після.
+// Рушій пошуку маршруту. Рівень 0 — WebAssembly (основний); 1 — запасний JavaScript.
+// На iPhone JS-версія циклу A* вбивала Safari (збій JIT), тому основний — WebAssembly. Якщо раптом і він
+// уб'є сторінку під час запуску чи пошуку, наступний запуск сам перейде на запасний рівень.
 try {
-  if (localStorage.getItem('navi.routing') === '1') {
-    localStorage.setItem('navi.eco', '1'); localStorage.removeItem('navi.routing'); window.NAVI_NO_TRAFFIC = true;
+  for (const k of ['navi.routing', 'navi.eco']) localStorage.removeItem(k);          // прапорці старих версій
+  let lv = +localStorage.getItem('navi.rlvl') || 0;
+  if (localStorage.getItem('navi.winit') === '1' || localStorage.getItem('navi.routing2') === '1') {
+    lv = 1; localStorage.setItem('navi.rlvl', '1'); window.NAVI_NO_TRAFFIC = true;
+    localStorage.removeItem('navi.winit'); localStorage.removeItem('navi.routing2');
   }
-} catch { }
-const ECO = () => { try { return localStorage.getItem('navi.eco') === '1'; } catch { return false; } };
+  window.NAVI_RLVL = lv;
+} catch { window.NAVI_RLVL = 0; }
+const ECO = () => { try { return localStorage.getItem('navi.eco2') === '1'; } catch { return false; } };
 
 // ---------- примусове оновлення коду ----------
 // Service worker може «залипнути» на старій версії. Тому: (1) ?reset=1 зносить усі
@@ -126,6 +132,7 @@ async function loadData() {
     const fuel = f.ok ? await f.json() : [];
     $('dataInfo').textContent = `${graph.meta?.name || 'карта'}: ${graph.nNodes} вузлів, ${graph.n} доріг, ${fuel.length} АЗС`;
     try { stage('route:alloc'); prepareRouting(graph); stage('route:alloc-ok'); } catch (e) { logErr('alloc: ' + e.message); }
+    initWasmRouter(graph);
     hint('');
     S.bldLoading = true;
     // Послідовно, а не паралельно: кожен файл на піку розпакування займає вдвічі
@@ -143,6 +150,41 @@ async function loadData() {
     toast('Немає даних карти');
     throw e;
   }
+}
+
+// WebAssembly-рушій: виділяємо пам'ять і копіюємо в неї граф (≈ 46 МБ) один раз, коли карта вже завантажена.
+function initWasmRouter(graph) {
+  if (window.NAVI_RLVL >= 1 || !wasmSupported()) { S.wasmState = 'вимкнено'; return; }
+  S.wasmState = 'готується';
+  S.wasmReady = new Promise((resolve) => {
+    setTimeout(async () => {
+      try {
+        localStorage.setItem('navi.winit', '1');
+        S.wasm = await createWasmRouter(graph, { stage: (m) => stage(m) });
+        localStorage.removeItem('navi.winit');
+        S.wasmState = 'готовий'; stage('wasm:ok');
+      } catch (e) {
+        try { localStorage.removeItem('navi.winit'); } catch { }
+        S.wasm = null; S.wasmState = 'помилка: ' + e.message; logErr('wasm: ' + e.message);
+      }
+      resolve(S.wasm);
+    }, 1500);
+  });
+}
+
+// Єдина точка пошуку шляху: WebAssembly, а якщо він недоступний — запасний JS.
+async function findRoute(from, to, { maxExpand = 300000, timeoutMs = 9000 } = {}) {
+  const g = S.graph;
+  if (window.NAVI_RLVL < 1 && S.wasmReady) {
+    const w = S.wasm || await Promise.race([S.wasmReady, new Promise(r => setTimeout(() => r(null), 4000))]);
+    if (w) {
+      S.engineUsed = 'WebAssembly';
+      const ov = trafficOverrides(g, S.traffic, TrafficMemory.slot());
+      return w.route(from, to, { vmax: VMAX, maxExpand, ov, timeoutMs });
+    }
+  }
+  S.engineUsed = 'JS (запасний)';
+  return routeAsync(g, from, to, speedByIdFrom(g, S.traffic, TrafficMemory.slot()), VMAX, { maxExpand, timeoutMs, cold: COLD });
 }
 
 async function loadBuildings(attempt = 1) {
@@ -564,17 +606,16 @@ async function routeTo(f) {
   // не має за що вбивати сторінку, навіть якщо пошук триватиме кілька секунд.
   S.routing = true;
   stage('route:search');
+  try { document.activeElement?.blur?.(); } catch { }
+  await new Promise(r => requestAnimationFrame(() => setTimeout(r, 80)));   // клавіатура й вікно пошуку встигають закритись
   // Економія пам'яті: на час маршруту вивантажуємо будинки (~50 МБ) — це дає запас пошуку
   if (ECO() && S.bld) { S.bld = null; stage('route:eco-free'); toast('Звільняю пам\'ять…', 4000); await new Promise(r => setTimeout(r, 200)); }
   const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
   stage('route:from');
   const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
   stage('route:to=' + tos.length);
-  // Страховка: якщо минулий маршрут убив сторінку — цього разу пробки не враховуємо.
-  try { localStorage.setItem('navi.routing', '1'); } catch { }
-  stage('route:speed');
-  const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
-  stage('route:speed-ok');
+  // Прапорець «іде пошук»: якщо сторінку вб'є, наступний запуск перейде на запасний рушій.
+  try { localStorage.setItem('navi.routing2', '1'); } catch { }
   let r = null; const t0 = performance.now(); let tries = 0;
   toast('Шукаю маршрут…', 9000);
   try {
@@ -582,22 +623,17 @@ async function routeTo(f) {
       if (isIsolated(g, to)) { stage('route:iso-skip'); continue; }
       stage('route:iso-ok');
       tries++;
-      let slices = 0, lastToast = 0;
-      try { localStorage.removeItem('navi.ast'); } catch { }
-      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 9000, cold: COLD, onStage: (m) => stage('astar:' + m),
-          // лічильники пишемо ДО кожного кроку: після падіння в журналі видно, на чому обірвалось
-          trace: (ex, hp, st) => { try { localStorage.setItem('navi.ast', `крок ${st}, розкрито ${ex}, купа ${hp}`); } catch { } } },
-        (p) => { slices++; if (slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5');
-          const now = Date.now(); if (now - lastToast > 500) { lastToast = now; toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000); } });
+      stage('route:engine');
+      r = await findRoute(from, to, { maxExpand: 300000, timeoutMs: 9000 });
       stage('route:async-done');
       if (r) break;
-      if (performance.now() - t0 > 7000) break;
+      if (performance.now() - t0 > 9000) break;
     }
   } catch (e) { logErr('route: ' + e.message); }
   S.routing = false;
-  try { localStorage.removeItem('navi.routing'); } catch { }
+  try { localStorage.removeItem('navi.routing2'); } catch { }
   console.log(`маршрут: ${tries} спроб, ${Math.round(performance.now() - t0)} мс, розкрито ${route.lastExpanded ?? '?'}`);
-  stage('route:found:' + Math.round(performance.now() - t0) + 'ms');
+  stage('route:found:' + Math.round(performance.now() - t0) + 'ms:' + (S.engineUsed || '?'));
   if (!r) {
     toast(`Не вдалося прокласти шлях до «${f.name || 'цілі'}» — можливо, туди немає проїзду по карті`);
     S.target = f; S.follow = false; S.view.cx = f.x; S.view.cy = f.y; draw();
@@ -639,7 +675,7 @@ function updateTurn() {
       S.rebuildAt = st.edge.id; S.rebuildT = Date.now();
       const to = S.routeInfo ? S.routeInfo.nodes[S.routeInfo.nodes.length - 1] : g.nearestNode([S.target.x, S.target.y]);
       S.routing = true;
-      routeAsync(g, st.edge.b, to, speedByIdFrom(g, S.traffic, TrafficMemory.slot()), VMAX, { maxExpand: 150000, timeoutMs: 5000, cold: COLD })
+      findRoute(st.edge.b, to, { maxExpand: 150000, timeoutMs: 5000 })
         .then(r => { if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; toast('Перебудовую маршрут'); } })
         .catch(e => logErr('rebuild: ' + e.message))
         .finally(() => { S.routing = false; });
@@ -1118,7 +1154,7 @@ function updateTrailInfo() {
     'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
     'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
     'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
-    'пошук: ' + (COLD ? 'холодний' : 'звичайний'),
+    'рушій пошуку: ' + (window.NAVI_RLVL >= 1 ? 'JS (запасний)' : 'WebAssembly — ' + (S.wasmState || '—') + (S.wasm ? `, ${S.wasm.memoryMB} МБ` : '')) + (S.engineUsed ? ` · востаннє: ${S.engineUsed}` : ''),
     'економія пам\'яті: ' + (ECO() ? 'так' : 'ні'),
     localStorage.getItem('navi.memtest') ? `тест пам'яті: ${localStorage.getItem('navi.memtest')}` : null,
     performance.memory ? `пам'ять JS: ${Math.round(performance.memory.usedJSHeapSize / 1048576)} МБ` : null,
@@ -1129,7 +1165,7 @@ function updateTrailInfo() {
     + 'етапи: ' + trail.slice(-12).join(' → ');
 }
 function updateEcoInfo() { const e = $('ecoInfo'); if (e) e.textContent = ECO() ? 'увімкнена: на час маршруту адреси вимкнені, зате пошук не падає' : 'вимкнена'; }
-$('btnEco')?.addEventListener('click', () => { try { localStorage.setItem('navi.eco', ECO() ? '0' : '1'); } catch { } updateEcoInfo(); toast(ECO() ? 'Економію пам\'яті увімкнено' : 'Економію вимкнено'); });
+$('btnEco')?.addEventListener('click', () => { try { localStorage.setItem('navi.eco2', ECO() ? '0' : '1'); } catch { } updateEcoInfo(); toast(ECO() ? 'Економію пам\'яті увімкнено' : 'Економію вимкнено'); });
 updateEcoInfo();
 // Тест пам'яті: виділяє по 8 МБ, доки систему не вичерпано. Перед кожним кроком число пишеться
 // в localStorage, тож після перезапуску в журналі видно, скільки телефон дозволив.
@@ -1158,7 +1194,7 @@ $('btnTrailCopy')?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(txt); toast('Журнал скопійовано — вставте його мені в чат'); }
   catch (e) { toast('Не вдалося скопіювати — зробіть скриншот'); }
 });
-$('btnTrailClear')?.addEventListener('click', () => { try { localStorage.removeItem(TRAIL_KEY); localStorage.removeItem(ERR_KEY); } catch (e) {} updateTrailInfo(); toast('Журнал очищено'); });
+$('btnTrailClear')?.addEventListener('click', () => { try { localStorage.removeItem(TRAIL_KEY); localStorage.removeItem(ERR_KEY); localStorage.removeItem('navi.rlvl'); } catch (e) {} updateTrailInfo(); toast('Журнал очищено'); });
 
 function updateScreenInfo() {
   const el = $('screenInfo'); if (!el) return;
