@@ -147,12 +147,18 @@ export function route(graph, fromNode, toNode, speedById = null, vmax = 25, opts
  */
 export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax = 25, opts = {}, onProgress = null) {
   if (fromNode === toNode) return { nodes: [fromNode], edges: [], length: 0, time: 0, expanded: 0, capped: false };
+  const mark = opts.onStage || (() => {});
+  mark('prep');
   const st = _prepare(graph, fromNode, toNode, speedById, vmax, opts.maxExpand ?? 300000);
+  mark('prep-ok');
   const sliceMs = opts.sliceMs ?? 12, t0 = performance.now(), timeoutMs = opts.timeoutMs ?? 8000;
-  let done = false;
+  let done = false, first = true;
   while (!done) {
     const ts = performance.now();
-    while (!done && performance.now() - ts < sliceMs) done = _step(st, 2000);
+    while (!done && performance.now() - ts < sliceMs) {
+      done = _step(st, first ? 50 : 2000);
+      if (first) { first = false; mark('step1-ok'); }
+    }
     if (done) break;
     if (performance.now() - t0 > timeoutMs) { st.capped = true; break; }
     if (onProgress) onProgress(Math.max(0, Math.min(0.99, 1 - st.bestH / Math.max(1, st.h0))));
@@ -164,12 +170,21 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
 // Швидкість ребра за id з «пам'яті пробок»: спостереження, якщо є, інакше вільна за класом.
 export function speedByIdFrom(graph, traffic, slot) {
   const cls = graph.cls;
-  const hasData = !!(traffic && traffic.hasData);
-  return (eid) => {
-    if (hasData && traffic.data[eid]) {
-      const v = traffic.expected({ id: eid }, slot);
-      if (v !== null) return v;
+  // Спостереження з «пам'яті пробок» один раз перекладаємо в Map eid → м/с. Раніше на кожне
+  // ребро в гарячому циклі створювався об'єкт і масиви — на телефоні з накопиченою пам'яттю
+  // це роздувало купу й підвішувало пошук.
+  let ov = null;
+  if (traffic && traffic.hasData && !globalThis.NAVI_NO_TRAFFIC) {
+    ov = new Map();
+    const edge = { id: 0 };
+    for (const k in traffic.data) {
+      edge.id = k;
+      const v = traffic.expected(edge, slot);
+      if (v !== null && isFinite(v)) ov.set(+k, v);
     }
+  }
+  return (eid) => {
+    if (ov !== null) { const v = ov.get(eid); if (v !== undefined) return v; }
     return FREEFLOW_BY_CLS[cls[eid]] || 9;
   };
 }

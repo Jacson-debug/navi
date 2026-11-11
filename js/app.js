@@ -490,7 +490,14 @@ async function routeTo(f) {
   stage('route:from');
   const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
   stage('route:to=' + tos.length);
+  // Страховка: якщо минулий маршрут убив сторінку — цього разу пробки не враховуємо.
+  try {
+    if (localStorage.getItem('navi.routing') === '1') { window.NAVI_NO_TRAFFIC = true; stage('route:no-traffic'); }
+    localStorage.setItem('navi.routing', '1');
+  } catch { }
+  stage('route:speed');
   const speedById = speedByIdFrom(g, S.traffic, TrafficMemory.slot());
+  stage('route:speed-ok');
   let r = null; const t0 = performance.now(); let tries = 0;
   toast('Шукаю маршрут…', 9000);
   try {
@@ -499,7 +506,7 @@ async function routeTo(f) {
       stage('route:iso-ok');
       tries++;
       let slices = 0;
-      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000 },
+      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000, onStage: (m) => stage('astar:' + m) },
         (p) => { if (++slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5'); toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000); });
       stage('route:async-done');
       if (r) break;
@@ -507,6 +514,7 @@ async function routeTo(f) {
     }
   } catch (e) { logErr('route: ' + e.message); }
   S.routing = false;
+  try { localStorage.removeItem('navi.routing'); } catch { }
   console.log(`маршрут: ${tries} спроб, ${Math.round(performance.now() - t0)} мс, розкрито ${route.lastExpanded ?? '?'}`);
   stage('route:found:' + Math.round(performance.now() - t0) + 'ms');
   if (!r) {
