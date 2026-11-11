@@ -573,9 +573,13 @@ async function routeTo(f) {
       if (isIsolated(g, to)) { stage('route:iso-skip'); continue; }
       stage('route:iso-ok');
       tries++;
-      let slices = 0;
-      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000, onStage: (m) => stage('astar:' + m) },
-        (p) => { if (++slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5'); toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000); });
+      let slices = 0, lastToast = 0;
+      try { localStorage.removeItem('navi.ast'); } catch { }
+      r = await routeAsync(g, from, to, speedById, VMAX, { maxExpand: 300000, timeoutMs: 7000, onStage: (m) => stage('astar:' + m),
+          // лічильники пишемо ДО кожного кроку: після падіння в журналі видно, на чому обірвалось
+          trace: (ex, hp, st) => { try { localStorage.setItem('navi.ast', `крок ${st}, розкрито ${ex}, купа ${hp}`); } catch { } } },
+        (p) => { slices++; if (slices === 1) stage('route:slice1'); if (slices === 5) stage('route:slice5');
+          const now = Date.now(); if (now - lastToast > 500) { lastToast = now; toast(`Шукаю маршрут… ${Math.round(p * 100)}%`, 9000); } });
       stage('route:async-done');
       if (r) break;
       if (performance.now() - t0 > 7000) break;
@@ -1104,6 +1108,7 @@ function updateTrailInfo() {
   ].filter(Boolean).join('\n');
   el.textContent = `${$('ver')?.textContent || ''}${sv}${ua ? ' · iOS ' + ua : ''}${SAFE ? ' · безпечний режим' : ''}\n${env}\n`
     + (errs.length ? 'ПОМИЛКИ:\n' + errs.slice(-5).join('\n') + '\n' : '')
+    + (localStorage.getItem('navi.ast') ? 'останній крок пошуку: ' + localStorage.getItem('navi.ast') + '\n' : '')
     + 'етапи: ' + trail.slice(-12).join(' → ');
 }
 $('btnUpdate')?.addEventListener('click', async () => { toast('Оновлюю код…'); await hardReset(); });

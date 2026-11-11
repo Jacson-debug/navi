@@ -60,10 +60,11 @@ function scratch(graph) {
   return (graph._astar = {
     g: new Float32Array(n),       // вартість від старту
     prev: new Int32Array(n),      // ребро, яким прийшли
-    stamp: new Uint32Array(n),    // «покоління» запису — щоб не чистити масиви щоразу
-    closed: new Uint32Array(n),
+    stamp: new Int32Array(n),     // «покоління» запису — щоб не чистити масиви щоразу
+    closed: new Int32Array(n),    // Int32, а не Uint32: JavaScriptCore не любить uint32 > 2^31 у гарячому циклі
     gen: 0,
     heap: new MinHeap(1 << 16),
+    base: null, spd: null,        // швидкість за ребром (м/с) — заповнюється при першому маршруті
   });
 }
 
@@ -73,24 +74,38 @@ function scratch(graph) {
  *   opts.maxExpand — стеля розкритих вузлів (типово 300 000).
  * Повертає { nodes, edges, length, time, expanded, capped } або null.
  */
+function ensureSpd(graph, S) {
+  if (!S.spd) {
+    const nE = graph.n, cls = graph.cls;
+    S.spd = new Float32Array(nE); S.base = new Float32Array(nE);
+    for (let e = 0; e < nE; e++) S.base[e] = FREEFLOW_BY_CLS[cls[e]] || 9;
+  }
+  return S.spd;
+}
+
 // Внутрішній крок: спільний для синхронної та покрокової версій.
 function _prepare(graph, fromNode, toNode, speedById, vmax, maxExpand) {
   const S = scratch(graph);
-  if (S.gen >= 0xfffffff0) { S.stamp.fill(0); S.closed.fill(0); S.gen = 0; }
+  if (S.gen >= 0x7ffffff0) { S.stamp.fill(0); S.closed.fill(0); S.gen = 0; }
   const gen = ++S.gen;
   S.heap.clear();
   const X = graph.nodeX, Y = graph.nodeY;
   const gx = X[toNode], gy = Y[toNode];
   const hdiv = speedById ? vmax : 1;
+  let spd = null;
+  if (speedById) {
+    if (speedById.arr) spd = speedById.arr;
+    else { spd = ensureSpd(graph, S); for (let e = 0, m = graph.n; e < m; e++) spd[e] = Math.max(0.3, speedById(e)); }
+  }
   const h = (node) => { const dx = X[node] - gx, dy = Y[node] - gy; return Math.sqrt(dx * dx + dy * dy) / hdiv; };
   S.stamp[fromNode] = gen; S.g[fromNode] = 0; S.prev[fromNode] = -1;
   S.heap.push(h(fromNode), fromNode);
-  return { S, gen, h, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
+  return { S, gen, h, spd, h0: h(fromNode), expanded: 0, found: false, capped: false, maxExpand, fromNode, toNode, speedById, graph, bestH: h(fromNode) };
 }
 
 // Виконує до `budget` розкриттів. Повертає true, коли пошук завершено.
 function _step(st, budget) {
-  const { S, gen, h, graph, toNode, speedById } = st;
+  const { S, gen, h, graph, toNode, spd } = st;
   const { g, prev, stamp, closed, heap } = S;
   const len = graph.len, B = graph.b, outOff = graph.outOff, outList = graph.outList;
   let n = 0;
@@ -105,7 +120,7 @@ function _step(st, budget) {
     for (let k = outOff[u], end = outOff[u + 1]; k < end; k++) {
       const eid = outList[k], nb = B[eid];
       if (closed[nb] === gen) continue;
-      const ng = gu + (speedById ? len[eid] / Math.max(0.3, speedById(eid)) : len[eid]);
+      const ng = spd !== null ? gu + len[eid] / spd[eid] : gu + len[eid];
       if (stamp[nb] !== gen || ng < g[nb]) {
         stamp[nb] = gen; g[nb] = ng; prev[nb] = eid;
         const hn = h(nb); if (hn < st.bestH) st.bestH = hn;
@@ -118,7 +133,7 @@ function _step(st, budget) {
 }
 
 function _finish(st) {
-  const { S, graph, fromNode, toNode, speedById, expanded } = st;
+  const { S, graph, fromNode, toNode, spd, expanded } = st;
   route.lastExpanded = expanded; route.lastCapped = st.capped;
   if (!st.found) return null;
   const len = graph.len, prev = S.prev;
@@ -127,7 +142,7 @@ function _finish(st) {
   while (cur !== fromNode) { const eid = prev[cur]; edges.push(eid); cur = graph.a[eid]; nodes.push(cur); }
   edges.reverse(); nodes.reverse();
   let length = 0, time = 0;
-  for (const eid of edges) { length += len[eid]; time += speedById ? len[eid] / Math.max(0.3, speedById(eid)) : len[eid] / 11; }
+  for (const eid of edges) { length += len[eid]; time += spd !== null ? len[eid] / spd[eid] : len[eid] / 11; }
   return { nodes, edges, length, time, expanded, capped: false };
 }
 
@@ -152,11 +167,13 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
   const st = _prepare(graph, fromNode, toNode, speedById, vmax, opts.maxExpand ?? 300000);
   mark('prep-ok');
   const sliceMs = opts.sliceMs ?? 12, t0 = performance.now(), timeoutMs = opts.timeoutMs ?? 8000;
-  let done = false, first = true;
+  let done = false, first = true, steps = 0;
+  const trace = opts.trace || null;
   while (!done) {
     const ts = performance.now();
     while (!done && performance.now() - ts < sliceMs) {
-      done = _step(st, first ? 50 : 2000);
+      if (trace && (++steps <= 12 || (steps & 3) === 0)) trace(st.expanded, st.S.heap.n, steps);
+      done = _step(st, first ? 50 : 1000);
       if (first) { first = false; mark('step1-ok'); }
     }
     if (done) break;
@@ -169,24 +186,21 @@ export async function routeAsync(graph, fromNode, toNode, speedById = null, vmax
 
 // Швидкість ребра за id з «пам'яті пробок»: спостереження, якщо є, інакше вільна за класом.
 export function speedByIdFrom(graph, traffic, slot) {
-  const cls = graph.cls;
-  // Спостереження з «пам'яті пробок» один раз перекладаємо в Map eid → м/с. Раніше на кожне
-  // ребро в гарячому циклі створювався об'єкт і масиви — на телефоні з накопиченою пам'яттю
-  // це роздувало купу й підвішувало пошук.
-  let ov = null;
+  // Швидкість кожного ребра — у Float32Array: у гарячому циклі жодних викликів і об'єктів.
+  const S = scratch(graph), arr = ensureSpd(graph, S);
+  arr.set(S.base);
   if (traffic && traffic.hasData && !globalThis.NAVI_NO_TRAFFIC) {
-    ov = new Map();
     const edge = { id: 0 };
     for (const k in traffic.data) {
       edge.id = k;
       const v = traffic.expected(edge, slot);
-      if (v !== null && isFinite(v)) ov.set(+k, v);
+      const e = +k;
+      if (v !== null && isFinite(v) && e >= 0 && e < graph.n) arr[e] = Math.max(0.3, v);
     }
   }
-  return (eid) => {
-    if (ov !== null) { const v = ov.get(eid); if (v !== undefined) return v; }
-    return FREEFLOW_BY_CLS[cls[eid]] || 9;
-  };
+  const fn = (eid) => arr[eid];
+  fn.arr = arr;
+  return fn;
 }
 
 // Перетворює маршрут на список підказок: повороти з відстанями.
