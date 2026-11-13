@@ -27,7 +27,7 @@ let RoadGraph, A, g = null, ver = '?';
 try {
   ({ RoadGraph } = await import('./js/graph.js' + fresh));
   A = await import('./js/astar.js' + fresh);
-  ver = A.ASTAR_VERSION || 'стара (<0.8.18)';
+  ver = A.ASTAR_VERSION || 'стара (<0.8.20)';
 } catch (e) { $('log').textContent = 'Не вдалося завантажити модулі: ' + e.message; }
 
 async function ensureG() {

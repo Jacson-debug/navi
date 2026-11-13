@@ -11,7 +11,7 @@
 // Швидкість за класом дороги (м/с) — для режиму «найшвидший маршрут».
 // Порядок класів як у graph.js: service, living_street, residential, road, unclassified,
 // tertiary, secondary, primary, trunk, motorway
-export const ASTAR_VERSION = '0.8.18';
+export const ASTAR_VERSION = '0.8.20';
 export const FREEFLOW_BY_CLS = new Float32Array(16).fill(9);
 FREEFLOW_BY_CLS.set([20, 15, 30, 30, 35, 40, 45, 50, 70, 90].map(v => v / 3.6));
 
@@ -237,7 +237,7 @@ export function trafficOverrides(graph, traffic, slot) {
   for (const k in traffic.data) {
     edge.id = k;
     const v = traffic.expected(edge, slot), e = +k;
-    if (v !== null && isFinite(v) && e >= 0 && e < graph.n) ov.set(e, Math.max(0.3, v));
+    if (v !== null && isFinite(v) && e >= 0 && e < graph.n) ov.set(e, Math.max(2.5, 0.3 * FREEFLOW_BY_CLS[graph.cls[e]], v));   // не нижче 30% вільної швидкості: інакше A* розкриває пів міста
   }
   return ov.size ? ov : null;
 }

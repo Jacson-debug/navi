@@ -180,7 +180,16 @@ async function findRoute(from, to, { maxExpand = 300000, timeoutMs = 9000 } = {}
     if (w) {
       S.engineUsed = 'WebAssembly';
       const ov = trafficOverrides(g, S.traffic, TrafficMemory.slot());
-      return w.route(from, to, { vmax: VMAX, maxExpand, ov, timeoutMs });
+      let r = w.route(from, to, { vmax: VMAX, maxExpand, ov, timeoutMs });
+      r = await r;
+      if (r) return r;
+      // Не знайшов: другий шанс — без пам'яті пробок (раптом вона щось «закрила»)
+      if (ov) { r = await w.route(from, to, { vmax: VMAX, maxExpand, ov: null, timeoutMs }); if (r) { stage('route:ok-no-traffic'); return r; } }
+      S.lastFail = `wasm: розкрито ${w.lastExpanded}, ${Math.round(w.lastMs)} мс, з ${from} до ${to}`;
+      stage('route:wasm-null:' + w.lastExpanded);
+      // і третій — перевірений JS-пошук (холодний) як арбітр
+      S.engineUsed = 'JS (арбітр)';
+      return routeAsync(g, from, to, speedByIdFrom(g, null, 0), VMAX, { maxExpand, timeoutMs, cold: true });
     }
   }
   S.engineUsed = 'JS (запасний)';
@@ -610,7 +619,8 @@ async function routeTo(f) {
   await new Promise(r => requestAnimationFrame(() => setTimeout(r, 80)));   // клавіатура й вікно пошуку встигають закритись
   // Економія пам'яті: на час маршруту вивантажуємо будинки (~50 МБ) — це дає запас пошуку
   if (ECO() && S.bld) { S.bld = null; stage('route:eco-free'); toast('Звільняю пам\'ять…', 4000); await new Promise(r => setTimeout(r, 200)); }
-  const from = st.edge ? st.edge.b : g.nearestNode(st.xy);
+  const froms = [...new Set([st.edge ? st.edge.b : g.nearestNode(st.xy), st.edge ? st.edge.a : -1, g.nearestNode(st.xy)])].filter(v => v >= 0);
+  let from = froms[0];
   stage('route:from');
   const tos = [...new Set([...g.nearestNodes([f.x, f.y], 600, 1, 3), g.nearestNode([f.x, f.y])])].slice(0, 3);
   stage('route:to=' + tos.length);
@@ -624,7 +634,7 @@ async function routeTo(f) {
       stage('route:iso-ok');
       tries++;
       stage('route:engine');
-      r = await findRoute(from, to, { maxExpand: 300000, timeoutMs: 9000 });
+      for (const f0 of froms) { from = f0; r = await findRoute(from, to, { maxExpand: 300000, timeoutMs: 9000 }); if (r) break; if (performance.now() - t0 > 9000) break; }
       stage('route:async-done');
       if (r) break;
       if (performance.now() - t0 > 9000) break;
@@ -635,7 +645,7 @@ async function routeTo(f) {
   console.log(`маршрут: ${tries} спроб, ${Math.round(performance.now() - t0)} мс, розкрито ${route.lastExpanded ?? '?'}`);
   stage('route:found:' + Math.round(performance.now() - t0) + 'ms:' + (S.engineUsed || '?'));
   if (!r) {
-    toast(`Не вдалося прокласти шлях до «${f.name || 'цілі'}» — можливо, туди немає проїзду по карті`);
+    toast(`Не вдалося прокласти шлях до «${f.name || 'цілі'}» — можливо, туди немає проїзду по карті`); try { localStorage.setItem('navi.ast', 'ПОМИЛКА ПОШУКУ: ' + (S.lastFail || 'немає даних') + '; початкових вузлів ' + froms.length + ', цілей ' + tos.length); } catch { }
     S.target = f; S.follow = false; S.view.cx = f.x; S.view.cy = f.y; draw();
     return;
   }
