@@ -764,14 +764,20 @@ let motionArmed = false;
 function armMotionOnFirstTouch() {
   if (motionArmed || S.motionOn) return;
   motionArmed = true;
-  const go = () => {
-    removeEventListener('pointerdown', go, true);
-    removeEventListener('touchstart', go, true);
-    enableMotion({ quiet: true });
+  // iOS дає вікно дозволу лише з «touchend»/«click» (не з «pointerdown»), тому слухаємо їх і
+  // пробуємо знову при кожному дотику, доки дозвіл не отримано.
+  const go = async () => {
+    if (S.motionOn) { for (const t of ['touchend', 'click']) removeEventListener(t, go, true); return; }
+    const ok = await enableMotion({ quiet: true });
+    if (ok) { for (const t of ['touchend', 'click']) removeEventListener(t, go, true); updateMotionChip(); }
   };
-  addEventListener('pointerdown', go, true);
-  addEventListener('touchstart', go, true);
+  for (const t of ['touchend', 'click']) addEventListener(t, go, true);
 }
+function updateMotionChip() {
+  const c = $('motionChip'); if (!c) return;
+  c.style.display = (S.sensorsOn && !S.motionOn && motionNeedsPermission()) ? '' : 'none';
+}
+$('motionChip')?.addEventListener('click', async () => { const ok = await enableMotion({}); if (ok) toast('Датчики руху увімкнено'); updateMotionChip(); });
 
 function markRunning(on) {
   $('btnSensors').textContent = on ? '⏹ Стоп' : '▶ Старт';
@@ -800,6 +806,7 @@ async function autoStart() {
   let ok = false;
   if (granted || !motionNeedsPermission()) ok = await enableMotion({ quiet: true });
   if (!ok) armMotionOnFirstTouch();
+  updateMotionChip();
 }
 
 function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; Awake.off(); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
@@ -1271,7 +1278,7 @@ function updateStatus() {
   // щоб число не читалося як точне: акселерометр принципово не бачить сталої швидкості.
   const kmh = Math.round(st.speed * 3.6);
   $('speed').textContent = (st.source === 'gps' || !S.sensorsOn) ? String(kmh) : '≈' + kmh;
-  if (S.sensorsOn) eng.updateSource();
+  if (S.sensorsOn) { eng.updateSource(); eng.coastTick(); updateMotionChip(); }
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
   const gpsTxt = {
     none: 'Позиції нема', ok: 'Супутники', weak: 'Wi-Fi / слабкий сигнал',
@@ -1283,7 +1290,7 @@ function updateStatus() {
   $('txtGps').textContent = gpsTxt;
   $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' ? 'bad' : '');
   let modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду' }[st.mode] || st.mode;
-  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : 'офлайн: датчики + карта';
+  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : (st.coasting ? 'офлайн: веду за швидкістю' : 'офлайн: датчики + карта');
   $('txtMode').textContent = modeTxt;
   $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? (st.source === 'gps' ? 'ok' : 'warn') : st.mode === 'calibrating' ? 'warn' : '');
   // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами

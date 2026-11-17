@@ -27,7 +27,7 @@ export class NavEngine {
     //  порівняння «чи давно був GPS» ніколи не спрацьовувало.)
     this.lastFixWall = 0;        // будь-який прийнятий фікс
     this.lastGnssWall = 0;       // саме супутниковий
-    this.gpsLostAfter = opts.gpsLostAfter ?? 8;  // с без GNSS → автономний режим
+    this.gpsLostAfter = opts.gpsLostAfter ?? 5;  // с без GNSS → автономний режим
     // Джерело часу можна підмінити — так симулятор перевіряє ті самі переходи, що й телефон.
     this._now = opts.now ?? (() => Date.now() / 1000);
     this.gpsSnap = null;     // фікс, прив'язаний до дороги — те, що показуємо в режимі GPS
@@ -45,6 +45,7 @@ export class NavEngine {
 
   // ---------- вхід датчиків ----------
   pushMotion(sample) {
+    this.lastMotionWall = this.now();
     if (this.recording) this._recordMotion(sample);
     const r = this.motion.pushSample(sample);
     if (!r || !r.ready) { this.state.mode = r && !r.ready ? 'calibrating' : this.state.mode; return; }
@@ -253,9 +254,27 @@ export class NavEngine {
       this.state.source = this.pf.p.length ? 'dr' : 'none';
       if (hadGnss && this.state.gps === 'ok') this.state.gps = 'jammed';
       // Щойно втратили GPS: авто майже напевно їде далі з тією ж швидкістю.
-      if (was === 'gps' && this.state.source === 'dr') this.motion.coastFrom(this.state.speed);
+      if (was === 'gps' && this.state.source === 'dr') { this.motion.coastFrom(this.state.speed); this.coastV = this.state.speed; this.coastSince = this.now(); }
     }
     return this.state.source;
+  }
+
+  // Запасний хід без датчиків руху (iOS не дав дозвіл, або вони мовчать). Інакше при втраті GPS
+  // точка застигає. Тут «котимося» по дорозі зі швидкістю, яку мали в момент втрати GPS:
+  // 90 с рівно, далі плавно до нуля (4 хв). Частинки фільтра самі тримаються доріг.
+  coastTick() {
+    const now = this.now();
+    const last = this._lastCoast ?? now; this._lastCoast = now;
+    if (this.state.source !== 'dr' || !this.pf.p.length) { this.state.coasting = false; return; }
+    if (this.lastMotionWall && now - this.lastMotionWall < 1.5 && this.motion.ready) { this.state.coasting = false; return; }
+    const dt = Math.min(1, now - last); if (!(dt > 0)) return;
+    let v = this.coastV ?? 0; if (!(v > 1)) { this.state.coasting = true; return; }
+    const age = now - (this.coastSince ?? now);
+    if (age > 90) v *= Math.max(0, 1 - (age - 90) / 150);
+    if (this.state.edge >= 0) v = Math.min(v, EDGE_SPEED_CAP[this.g.level(this.state.edge)] || 30);
+    this.state.coasting = true; this.state.speed = v;
+    this.pf.step(v * dt, 0);
+    this._updateEstimate();
   }
 
   // Сумісність зі старим викликом
@@ -354,7 +373,7 @@ export class NavEngine {
 
     // У режимі GPS малюємо фікс, а не хмару — хмара лишається напоготові для офлайну.
     const g = this.gpsSnap;
-    if (g && this.state.source === 'gps' && this.now() - g.t < 8) {
+    if (g && this.state.source === 'gps' && this.now() - g.t < 5) {
       this.state.xy = g.xy;
       this.state.latlon = this.proj.toLL(g.xy[0], g.xy[1]);
       if (g.hdg !== null) this.state.heading = g.hdg;
