@@ -120,9 +120,10 @@
   <div class="row"><div class="name">Оновити код<small>знести кеш і завантажити свіжу версію з сервера</small></div><button id="btnUpdate">Оновити</button></div>
   <div class="row"><div class="name">Екран<small id="screenInfo">—</small></div><div></div></div>
   <div class="row"><div class="name">Автозапис поїздок<small id="recInfo">щоб підлаштувати алгоритм під ваше авто</small></div><button id="btnAutoRec">Увімк/вимк</button></div>
+  <div class="row"><div class="name">Журнал позицій<small>усе, що iOS давала як позицію (час, похибка, звідки). Після поїздки під час тривоги — «Поділитися» і надіслати мені</small></div><div style="display:flex;flex-direction:column;gap:6px"><button id="btnFixLog">Поділитися</button><button id="btnFixLogClear">Очистити</button></div></div>
   <div class="row"><div class="name">Зберегти лог поїздки<small>файл для розбору на комп'ютері</small></div><button id="btnRec">Зберегти</button></div>
   <div class="row"><div class="name">Дані карти</div><div id="dataInfo" style="color:var(--muted);font-size:13px"></div></div>
-  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.8.21</div></div>
+  <div class="row"><div class="name">Версія</div><div id="ver" style="color:var(--muted)">0.8.23</div></div>
 </div>
 
 <div class="rail">
@@ -130,6 +131,35 @@
   <button id="btnCenter" class="fab">⌖ Де я</button>
 </div>
 <div class="toast" id="toast"></div>
+<div id="bootFail" style="display:none;position:fixed;inset:0;z-index:9999;background:#0b0f17;color:#e8eef8;font:17px -apple-system,system-ui,sans-serif;padding:80px 24px;text-align:center">
+  <div style="font-size:22px;margin-bottom:14px">Наві не запустилась</div>
+  <div id="bootWhy" style="opacity:.7;font-size:14px;margin-bottom:28px;word-break:break-word"></div>
+  <button id="bootFix" style="font:inherit;padding:16px 28px;border-radius:14px;border:0;background:#3b82f6;color:#fff">Оновити код і перезапустити</button>
+  <div style="opacity:.6;font-size:13px;margin-top:18px">Карта й будинки збережуться, перезавантажиться лише код</div>
+</div>
+<script>
+// Сторож запуску (звичайний скрипт, працює навіть якщо модулі програми не завантажились).
+// Якщо за 12 с код не стартував або впав імпорт — показуємо кнопку, що зносить кеш коду.
+(function () {
+  var why = '';
+  function show() {
+    if (window.NAVI_BOOTED) return;
+    document.getElementById('bootWhy').textContent = why || 'код не завантажився (стара копія в кеші?)';
+    document.getElementById('bootFail').style.display = 'block';
+  }
+  addEventListener('error', function (e) { if (!window.NAVI_BOOTED) { why = (e.message || '') + ' ' + (e.filename || '').split('/').pop(); if (/import|export|module|SyntaxError/i.test(why)) setTimeout(show, 300); } }, true);
+  setTimeout(show, 12000);
+  document.getElementById('bootFix').onclick = function () {
+    var done = function () { location.replace(location.pathname + '?v=' + Date.now()); };
+    try {
+      Promise.all([
+        navigator.serviceWorker ? navigator.serviceWorker.getRegistrations().then(function (rs) { return Promise.all(rs.map(function (r) { return r.unregister(); })); }) : 0,
+        window.caches ? caches.keys().then(function (ks) { return Promise.all(ks.filter(function (k) { return k.indexOf('navi-data') !== 0; }).map(function (k) { return caches.delete(k); })); }) : 0
+      ]).then(done, done);
+    } catch (e) { done(); }
+  };
+})();
+</script>
 <script type="module" src="js/app.js"></script>
 </body>
 </html>

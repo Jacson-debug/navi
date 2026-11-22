@@ -27,7 +27,10 @@ export class NavEngine {
     //  порівняння «чи давно був GPS» ніколи не спрацьовувало.)
     this.lastFixWall = 0;        // будь-який прийнятий фікс
     this.lastGnssWall = 0;       // саме супутниковий
-    this.gpsLostAfter = opts.gpsLostAfter ?? 5;  // с без GNSS → автономний режим
+    this.gpsLostAfter = opts.gpsLostAfter ?? 5;  // с без GNSS → Wi-Fi або автономний режим
+    this.leadLostAfter = opts.leadLostAfter ?? 25; // с без Wi-Fi-фіксу → автономний режим
+    this.lastWifiWall = 0;       // останній фікс Wi-Fi/мережа (40–250 м)
+    this.hist = [];              // фікси за 40 с: швидкість і курс там, де система їх не дає
     // Джерело часу можна підмінити — так симулятор перевіряє ті самі переходи, що й телефон.
     this._now = opts.now ?? (() => Date.now() / 1000);
     this.gpsSnap = null;     // фікс, прив'язаний до дороги — те, що показуємо в режимі GPS
@@ -54,8 +57,8 @@ export class NavEngine {
     if (!(this.state.source === 'gps' && this.now() - this.lastGnssWall < 2.5)) {
       this.state.speed = r.speed;
       // Офлайн карта сама обмежує брехню: по дворовому проїзду 120 км/год не буває.
-      if (this.state.source === 'dr' && this.state.edge >= 0) {
-        const cap = EDGE_SPEED_CAP[this.g.level(this.state.edge)] || 30;
+      if (this.state.source === 'dr' && this.state.edge) {
+        const cap = EDGE_SPEED_CAP[this.g.level(this.state.edge.id)] || 30;
         if (this.motion.speed > cap) { this.motion.speed = cap; this.state.speed = cap; }
       }
     }
@@ -85,22 +88,21 @@ export class NavEngine {
   }
 
   // Фікс позиції від системи: lat, lon, accuracy (м), speed (м/с або null).
-  // iOS не дає застосунку сирі вежі зв'язку й Wi-Fi, але сама визначає по них позицію
-  // і повертає її через той самий geolocation — лише з великим радіусом похибки.
-  // Тому класифікуємо фікс за точністю, а не за джерелом:
-  //   ≤40 м   — супутники (GNSS): точна прив'язка;
-  //   ≤250 м  — змішаний (Wi-Fi поруч): помірна;
-  //   ≤3 км   — мережа (вежі зв'язку): груба, але її РЕБ не глушить;
-  //   ≤50 км  — «приблизна геолокація» iOS або одна далека вежа. Прив'язати до
-  //             вулиці неможливо (у колі тисячі доріг), але показати коло варто:
-  //             людина бачить, де вона приблизно, і уточнює кнопкою «Я тут»;
+  // iOS не дає застосунку ні веж зв'язку, ні списку Wi-Fi — лише свою готову позицію через
+  // geolocation. Коли супутники заглушені, iOS сама рахує місце по Wi-Fi-точках і вежах і
+  // віддає його тим самим каналом, тільки з більшою похибкою. Тому класифікуємо за точністю:
+  //   ≤40 м   — супутники (або дуже щільний Wi-Fi): веде, як GPS;
+  //   ≤250 м  — Wi-Fi / змішаний: ТЕЖ ВЕДЕ, коли супутників нема (саме це й є «без GPS» у місті);
+  //   ≤3 км   — лише вежі зв'язку: тримає від розбігання, коли нічого точнішого немає;
+  //   ≤50 км  — «приблизна геопозиція» iOS: лише коло на карті;
   //   більше  — ігноруємо.
   pushGps(fix) {
     if (this.recording) { this.fixLog.push({ k: 'g', ...fix }); if (this.fixLog.length > 20000) this.fixLog.splice(0, 5000); }
     const xy = this.proj.toXY(fix.lat, fix.lon);
     const acc = fix.accuracy ?? 30;
-    const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'mixed' : acc <= 3000 ? 'net'
+    const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'wifi' : acc <= 3000 ? 'net'
       : acc <= 50000 ? 'coarse' : 'junk';
+    this.lastKind = kind; this.lastAcc = acc; this.lastAnyWall = this.now();
     if (kind === 'junk') return;
 
     if (kind === 'coarse') {
@@ -109,172 +111,216 @@ export class NavEngine {
       return;
     }
 
-    // Перший фікс будь-якої якості задає початкове коло пошуку: груба позиція від
-    // мережі накриває багато доріг, але фільтр звужує варіанти вже за кілька поворотів.
+    // Перший фікс будь-якої якості задає початкове коло пошуку.
     if (!this.pf.p.length) {
       this.state.hint = null;
-      this.pf.initAround(xy, Math.max(60, Math.min(acc * 1.5, 3000)));
+      this.pf.initAround(xy, Math.max(40, Math.min(acc * 1.2, 3000)));
       this.state.mode = 'tracking';
-      this.state.gps = kind === 'gnss' ? 'ok' : kind === 'mixed' ? 'weak' : 'net';
-      if (kind !== 'net') this.lastGoodGps = { t: fix.t, xy };
-      if (kind === 'net') this.lastNet = { t: fix.t, xy, acc };
-      this._updateEstimate();
-      return;
+      if (kind === 'net') {
+        this.state.gps = 'net';
+        this.lastNet = { t: fix.t, xy, acc };
+        this.state.net = { xy, acc, t: fix.t };
+        this.lastFixWall = this.now();
+        this._updateEstimate();
+        return;
+      }
+      // gnss / wifi — далі звичайною дорогою: прив'язка до дороги, швидкість, курс
     }
 
     if (kind === 'net') {
-      // Мережевий фікс не веде, а лише утримує від розбігання: підтягуємо тільки тоді,
-      // коли власна оцінка вийшла за коло похибки, тобто суперечить мережі.
+      // Лише вежі: не веде, а не дає розбігтися. Коли нічого точнішого давно немає —
+      // пересіваємо гіпотези в колі, щойно власна оцінка з нього вийшла.
       this.lastNet = { t: fix.t, xy, acc };
       this.state.net = { xy, acc, t: fix.t };
       this.lastFixWall = this.now();
-      if (this.state.gps !== 'ok' && this.state.gps !== 'weak') this.state.gps = 'net';
+      if (this.state.gps !== 'ok' && this.state.gps !== 'wifi') this.state.gps = 'net';
       if (this.state.xy) {
+        const leadFresh = this.now() - Math.max(this.lastGnssWall, this.lastWifiWall) < this.leadLostAfter;
         const off = dist(this.state.xy, xy);
-        if (off > acc) {
-          // Ми поза колом похибки — наша гіпотеза суперечить незалежному джерелу.
-          // Саме лише зважування тут не рятує: пересіваємо частину гіпотез у колі.
-          this.pf.reseedAround(xy, acc, 0.6);
-        }
-        this.pf.weightByPosition(xy, acc * 0.6);
+        if (!leadFresh && off > acc * 0.6) this.pf.reseedAround(xy, acc, 0.6);
+        if (!leadFresh) this.pf.weightByPosition(xy, acc * 0.6);
         this._updateEstimate();
       }
       return;
     }
 
-    // --- точний фікс: перевіряємо на підміну ---
+    // --- точний (gnss) або Wi-Fi-фікс: перевіряємо на підміну ---
     let plausible = true;
     if (this.lastGoodGps) {
       const dt = Math.max(0.5, fix.t - this.lastGoodGps.t);
       const maxMove = 50 * dt + acc + 30;
       if (dist(xy, this.lastGoodGps.xy) > maxMove) plausible = false;
     }
-    if (plausible && this.state.xy && this.state.confidence > 0.5 && this.state.spread < 60) {
+    // Стрибок відносно власної впевненої оцінки — лише поки останній добрий фікс свіжий.
+    // Інакше після довгої їзди наосліп застосунок міг назавжди відкидати справжній GPS.
+    if (plausible && this.lastGoodGps && fix.t - this.lastGoodGps.t < 30 && this.state.xy && this.state.confidence > 0.5 && this.state.spread < 60) {
       if (dist(xy, this.state.xy) > 250 + 3 * acc) plausible = false;
     }
-    // Перехресна перевірка мережею: РЕБ підміняє супутниковий сигнал, але не вежі зв'язку.
-    // Якщо «точний» фікс далеко за межами свіжого мережевого кола — йому не місце.
-    if (plausible && this.lastNet && fix.t - this.lastNet.t < 180) {
+    // Після довгої перерви (РЕБ) перший же «точний» фікс не приймаємо наосліп: підміна часто
+    // стрибає по кілометру щосекунди. Приймаємо, лише коли два фікси поспіль узгоджені між собою.
+    const cand = this.prevCand; this.prevCand = { t: fix.t, xy, acc };
+    if (plausible && (!this.lastGoodGps || fix.t - this.lastGoodGps.t > 30) && this.pf.p.length && this.state.xy) {
+      if (!cand || fix.t - cand.t > 6 || dist(xy, cand.xy) > 50 * Math.max(0.5, fix.t - cand.t) + acc + cand.acc + 20) plausible = false;
+    }
+    // Перехресна перевірка вежами: РЕБ підміняє супутниковий сигнал, але не вежі зв'язку.
+    if (plausible && kind === 'gnss' && this.lastNet && fix.t - this.lastNet.t < 180) {
       if (dist(xy, this.lastNet.xy) > this.lastNet.acc + 3 * acc + 300) { plausible = false; this.state.spoofByNet = true; }
     }
-
     if (!plausible) {
       this.gpsTrust = Math.max(0, this.gpsTrust - 0.4);
       this.state.spoof = true; this.state.gps = 'rejected';
       return;
     }
-    const prevGood = this.lastGoodGps;
+
+    const now = this.now();
     this.gpsTrust = Math.min(1, this.gpsTrust + 0.25);
     this.state.spoof = false; this.state.spoofByNet = false;
-    this.state.gps = kind === 'gnss' ? 'ok' : 'weak';
+    this.state.gps = kind === 'gnss' ? 'ok' : 'wifi';
+    this.state.leadAcc = acc;
     this.lastGoodGps = { t: fix.t, xy };
-    this.lastFixWall = this.now();
-    if (kind === 'gnss') { this.lastGnssWall = this.lastFixWall; this.state.source = 'gps'; }
+    this.lastFixWall = now;
+    if (kind === 'gnss') { this.lastGnssWall = now; this.state.source = 'gps'; }
+    else {
+      this.lastWifiWall = now;
+      if (!(this.lastGnssWall > 0 && now - this.lastGnssWall <= this.gpsLostAfter)) {
+        if (this.state.source !== 'wifi') { this.coastV = this.state.speed; this.coastSince = now; }
+        this.state.source = 'wifi';
+      }
+    }
 
-    // Поки GPS живий — він веде. Тягнемо хмару частинок щільно до фікса,
-    // щоб позиція була саме GPS-ом, прив'язаним до дороги, а не компромісом із датчиками.
-    if (this.gpsTrust >= 0.5) {
-      const sigma = kind === 'gnss' ? Math.max(12, acc * 0.6) : Math.max(25, acc);
-      this.pf.weightByPosition(xy, sigma);
-      if (kind === 'gnss' && acc <= 25 && dist(xy, this.state.xy || xy) > Math.max(60, acc * 3)) {
-        // далеко відійшли від GPS — пересіваємо, а не повземо до нього хвилину
-        this.pf.reseedAround(xy, Math.max(40, acc * 2), 0.7);
+    // Курс: від системи (лише в русі) або з руху між Wi-Fi-фіксами.
+    let hdg = (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 1.5)
+      ? fix.heading * Math.PI / 180 : null;
+
+    // Історія фіксів за 40 с — швидкість і курс там, де система їх не дає (Wi-Fi).
+    this.hist.push({ t: fix.t, xy });
+    while (this.hist.length > 2 && fix.t - this.hist[0].t > 40) this.hist.shift();
+    let vFix = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed)) ? fix.speed : null;
+    const minSpan = kind === 'gnss' ? 0.3 : 4;
+    // для Wi-Fi беремо найдавніший фікс у межах 25 с — шум ±65 м на 5 с дав би фантомні 40 км/год
+    let ref = null;
+    for (const h of this.hist) { if (fix.t - h.t <= (kind === 'gnss' ? 10 : 25) && fix.t - h.t >= minSpan) { ref = h; break; } }
+    if (ref) {
+      const d = dist(xy, ref.xy), dtf = fix.t - ref.t;
+      const noise = kind === 'gnss' ? 0 : Math.min(acc, 80) * 0.8;
+      if (vFix === null) { const v = Math.max(0, d - noise) / dtf; if (v < 55) vFix = kind === 'gnss' ? v : (this.state.speed > 0 ? 0.5 * this.state.speed + 0.5 * v : v); }
+      if (hdg === null && d > Math.max(kind === 'gnss' ? 15 : 30, noise * 1.5)) hdg = Math.atan2(xy[0] - ref.xy[0], xy[1] - ref.xy[1]);
+    }
+
+    // Частинки: щільно до фікса; якщо далеко відійшли — пересіваємо, а не повземо хвилину.
+    const sigma = kind === 'gnss' ? Math.max(12, acc * 0.6) : Math.max(20, acc * 0.7);
+    if (this.gpsTrust >= 0.5 || kind === 'wifi') this.pf.weightByPosition(xy, sigma);
+    // Порівнюємо з хмарою частинок, а не з показаною точкою: показана — це сама прив'язка до фіксу,
+    // і хмара могла лишитися далеко позаду (тоді при втраті сигналу точка стрибала б назад).
+    const far = kind === 'gnss' ? Math.max(60, acc * 3) : Math.max(50, acc);
+    const pe = this.pf.estimate();
+    if (!pe || (kind === 'gnss' ? (acc <= 25 && dist(xy, this.state.xy || xy) > far) : (dist(xy, pe.xy) > far || pe.spread > acc * 3))) {
+      this.pf.reseedAround(xy, kind === 'gnss' ? Math.max(40, acc * 2) : Math.max(35, acc * 0.8), 0.7);
+    }
+    if (hdg !== null && (fix.speed ?? vFix ?? 0) > 2.5) this.pf.weightByHeading(hdg, kind === 'gnss' ? 0.5 : 0.8);
+
+    // Прив'язка до дороги: показуємо саме її. Неперервність — бонус тому самому ребру й наступним.
+    const prevE = this.gpsSnap && this.gpsSnap.e >= 0 ? this.gpsSnap.e : -1;
+    let best = null;
+    for (const c of this.g.edgesNear(xy, Math.max(35, Math.min(acc * 1.2, 150)))) {
+      let cost = c.d;
+      if (hdg !== null) {
+        let d = c.edge.hdg - hdg;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d <= -Math.PI) d += 2 * Math.PI;
+        cost += Math.abs(d) * (kind === 'gnss' ? 60 : 40);
       }
-    }
-    // Поки GPS веде — показуємо саме його, прив'язаного до найближчої дороги.
-    // Раніше на екран ішло середнє по хмарі частинок, а воно доганяє фікс кілька
-    // секунд: саме через це рух виглядав із затримкою.
-    if (kind === 'gnss' && acc <= 60) {
-      const hdg = (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 1.5)
-        ? fix.heading * Math.PI / 180 : null;
-      // Ребра напрямлені, і найближче з них може дивитися назад. Якщо знаємо курс —
-      // вибираємо те, що з ним узгоджене, інакше точка «поїде» задом по своїй же вулиці.
-      let best = null;
-      for (const c of this.g.edgesNear(xy, Math.max(35, acc * 1.5))) {
-        let cost = c.d;
-        if (hdg !== null) {
-          let d = c.edge.hdg - hdg;
-          while (d > Math.PI) d -= 2 * Math.PI;
-          while (d <= -Math.PI) d += 2 * Math.PI;
-          cost += Math.abs(d) * 60;
-        }
-        if (!best || cost < best.cost) best = { cost, c };
+      if (prevE >= 0 && kind === 'wifi') {
+        if (c.edge.id === prevE || this.g.a[c.edge.id] === this.g.b[prevE]) cost -= Math.min(30, acc * 0.4);
+        else if (this.g.rev[prevE] === c.edge.id) cost += 25;
       }
-      const m = best && best.c;
-      this.gpsSnap = m
-        ? { xy: m.point.slice(), e: m.edge.id, s: m.s, len: m.edge.len, hdg, acc, t: this.lastFixWall }
-        : { xy: xy.slice(), e: -1, s: 0, len: 0, hdg, acc, t: this.lastFixWall };
+      if (!best || cost < best.cost) best = { cost, c };
     }
-    // Курс від GPS знімає двозначність «туди/назад» по одній вулиці.
-    if (fix.heading != null && fix.heading >= 0 && isFinite(fix.heading) && (fix.speed ?? 0) > 2.5) {
-      this.pf.weightByHeading(fix.heading * Math.PI / 180, 0.5);
-    }
-    // Швидкість: беремо GPS-ову напряму. Інтегрування прискорення — лише
-    // підміна на час, коли GPS немає; тримати його як основне джерело не можна.
-    let vGps = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed)) ? fix.speed : null;
-    // Не кожен пристрій дає coords.speed. Тоді беремо її з відстані між фіксами —
-    // інакше на екрані 0 км/год, хоча точка впевнено їде.
-    if (vGps === null && prevGood) {
-      const dtf = fix.t - prevGood.t;
-      if (dtf > 0.3 && dtf < 10) {
-        const v = dist(xy, prevGood.xy) / dtf;
-        if (v < 70) vGps = v;
-      }
-    }
-    if (vGps !== null) {
-      this.motion.setSpeed(vGps);
-      this.state.speed = vGps;
+    const m = best && best.c;
+    this.gpsSnap = m
+      ? { xy: m.point.slice(), e: m.edge.id, s: m.s, len: m.edge.len, hdg, acc, t: now, kind }
+      : { xy: xy.slice(), e: -1, s: 0, len: 0, hdg, acc, t: now, kind };
+
+    if (vFix !== null) {
+      if (m && kind !== 'gnss') vFix = Math.min(vFix, EDGE_SPEED_CAP[this.g.level(m.edge.id)] || 30);
+      this.motion.setSpeed(vFix);
+      this.state.speed = vFix;
+      this.coastV = vFix;
     }
     this._updateEstimate();
   }
 
   now() { return this._now(); }
 
-  // Хто веде зараз. Поки є свіжий супутниковий фікс — GPS. Зник або підміняють —
-  // переходимо на датчики + карту. Викликається з таймера UI кілька разів на секунду.
+  // Хто веде зараз:
+  //   gps  — свіжий супутниковий фікс;
+  //   wifi — супутників нема, але iOS дає позицію по Wi-Fi/вежах з похибкою до 250 м;
+  //   dr   — нічого не приходить: датчики руху + карта, а без датчиків — «котимося» з останньою швидкістю.
   updateSource() {
-    const age = this.now() - this.lastGnssWall;
-    const hadGnss = this.lastGnssWall > 0;
+    const now = this.now();
+    const was = this.state.source;
     if (this.state.spoof || this.state.spoofByNet) {
-      if (this.state.source === 'gps') this.motion.coastFrom(this.state.speed);
+      if (was === 'gps' || was === 'wifi') { this.motion.coastFrom(this.state.speed); this.coastV = this.state.speed; this.coastSince = now; }
       this.state.source = 'dr';
       this.state.gps = 'rejected';
       return 'dr';
     }
+    const hadGnss = this.lastGnssWall > 0, gAge = now - this.lastGnssWall;
+    const wAge = now - this.lastWifiWall;
+    const sensorsLive = this.lastMotionWall && now - this.lastMotionWall < 1.5 && this.motion.ready;
     // Коли авто стоїть, система може не надсилати нових фіксів — і це не РЕБ.
-    // Без цієї перевірки на припаркованій машині писало б «GPS глушиться».
-    if (hadGnss && age > this.gpsLostAfter && this.motion.stationary && this.state.source === 'gps') {
-      return 'gps';
-    }
-    if (hadGnss && age <= this.gpsLostAfter) {
+    const stopped = sensorsLive ? this.motion.stationary : this.state.speed < 1;
+    if (hadGnss && was === 'gps' && gAge > this.gpsLostAfter && gAge < 60 && stopped) return 'gps';
+
+    if (hadGnss && gAge <= this.gpsLostAfter) {
       this.state.source = 'gps';
       if (this.state.gps === 'jammed') this.state.gps = 'ok';
+    } else if (this.lastWifiWall > 0 && wAge <= this.leadLostAfter) {
+      this.state.source = 'wifi';
+      this.state.gps = 'wifi';
     } else {
-      const was = this.state.source;
       this.state.source = this.pf.p.length ? 'dr' : 'none';
-      if (hadGnss && this.state.gps === 'ok') this.state.gps = 'jammed';
-      // Щойно втратили GPS: авто майже напевно їде далі з тією ж швидкістю.
-      if (was === 'gps' && this.state.source === 'dr') { this.motion.coastFrom(this.state.speed); this.coastV = this.state.speed; this.coastSince = this.now(); }
+      if (this.state.gps === 'ok' || this.state.gps === 'wifi') this.state.gps = hadGnss ? 'jammed' : 'lost';
+    }
+    if (was !== this.state.source && (was === 'gps' || was === 'wifi') && this.state.source !== 'gps') {
+      this.motion.coastFrom(this.state.speed);
+      this.coastV = this.state.speed; this.coastSince = now;
     }
     return this.state.source;
   }
 
-  // Запасний хід без датчиків руху (iOS не дав дозвіл, або вони мовчать). Інакше при втраті GPS
-  // точка застигає. Тут «котимося» по дорозі зі швидкістю, яку мали в момент втрати GPS:
-  // 90 с рівно, далі плавно до нуля (4 хв). Частинки фільтра самі тримаються доріг.
+  // Рух без датчиків (iOS не дав дозволу або вони мовчать). Без цього між фіксами точка стоїть.
+  //   wifi — між Wi-Fi-фіксами їдемо з виміряною по них швидкістю;
+  //   dr   — фіксів нема: 90 с рівно з останньою швидкістю, далі плавно до нуля (≈4 хв).
   coastTick() {
     const now = this.now();
     const last = this._lastCoast ?? now; this._lastCoast = now;
-    if (this.state.source !== 'dr' || !this.pf.p.length) { this.state.coasting = false; return; }
+    const src = this.state.source;
+    if (!this.pf.p.length) { this.state.coasting = false; return; }
     if (this.lastMotionWall && now - this.lastMotionWall < 1.5 && this.motion.ready) { this.state.coasting = false; return; }
     const dt = Math.min(1, now - last); if (!(dt > 0)) return;
-    let v = this.coastV ?? 0; if (!(v > 1)) { this.state.coasting = true; return; }
+    if (src === 'gps') {
+      // GPS веде сам, але хмара частинок має їхати разом із ним — вона стане опорою, щойно GPS зникне.
+      this.state.coasting = false;
+      if (this.state.speed > 0.8) this.pf.step(this.state.speed * dt, 0);
+      return;
+    }
+    if (src !== 'dr' && src !== 'wifi') { this.state.coasting = false; return; }
+    let v = src === 'wifi' ? this.state.speed : (this.coastV ?? 0);
     const age = now - (this.coastSince ?? now);
-    if (age > 90) v *= Math.max(0, 1 - (age - 90) / 150);
-    if (this.state.edge >= 0) v = Math.min(v, EDGE_SPEED_CAP[this.g.level(this.state.edge)] || 30);
-    this.state.coasting = true; this.state.speed = v;
+    if (src === 'dr' && age > 90) v *= Math.max(0, 1 - (age - 90) / 150);
+    if (this.state.edge) v = Math.min(v, EDGE_SPEED_CAP[this.g.level(this.state.edge.id)] || 30);
+    this.state.coasting = src === 'dr';
+    if (this.state.mode === 'calibrating') this.state.mode = 'tracking';
+    if (!(v > 0.8)) { if (src === 'dr') this.state.speed = 0; return; }
+    if (src === 'dr') this.state.speed = v;
     this.pf.step(v * dt, 0);
     this._updateEstimate();
+    if (src === 'dr') {
+      // Без датчиків ми лише припускаємо, що їдемо далі тим самим темпом: чесно показуємо, що це оцінка.
+      this.state.spread = Math.max(this.state.spread, 25 + age * 4);
+      this.state.confidence = Math.min(this.state.confidence, 0.4);
+    }
   }
 
   // Сумісність зі старим викликом
@@ -348,15 +394,34 @@ export class NavEngine {
   // їхати рівно, а не стрибати на 11 метрів.
   _advanceSnap(dt) {
     const g = this.gpsSnap;
-    if (!g || g.e < 0 || !(dt > 0) || this.state.source !== 'gps') return;
-    if (this.now() - g.t > 8) return;
-    const ds = this.state.speed * dt;
+    const src = this.state.source;
+    if (!g || g.e < 0 || !(dt > 0) || (src !== 'gps' && src !== 'wifi')) return;
+    if (this.now() - g.t > (src === 'gps' ? 8 : this.leadLostAfter)) return;
+    let ds = this.state.speed * dt;
     if (!(ds > 0)) return;
+    // Між рідкими Wi-Fi-фіксами їдемо далі за перехрестя — найпрямішим продовженням.
+    let guard = 0;
+    while (g.s + ds > g.len && src === 'wifi' && guard++ < 8) {
+      ds -= g.len - g.s;
+      const outs = this.g.outEdges(this.g.b[g.e]);
+      let nb = -1, bd = 1e9;
+      for (let k = 0; k < outs.length; k++) {
+        const e2 = outs[k]; if (e2 === this.g.rev[g.e]) continue;
+        let d = this.g.hdg[e2] - this.g.hdg[g.e];
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d <= -Math.PI) d += 2 * Math.PI;
+        if (Math.abs(d) < bd) { bd = Math.abs(d); nb = e2; }
+      }
+      if (nb < 0 || bd > 0.8) { ds = 0; g.s = g.len; break; }   // різкий поворот — чекаємо наступного фіксу
+      g.e = nb; g.s = 0; g.len = this.g.len[nb];
+    }
     g.s = Math.min(g.len, g.s + ds);
     g.xy = this.g.pointOnEdge(g.e, g.s);
     this.state.xy = g.xy;
     this.state.latlon = this.proj.toLL(g.xy[0], g.xy[1]);
+    this.state.edge = this.g.edge(g.e);
     this.state.s = g.s;
+    this.state.heading = this.g.hdg[g.e];
   }
 
   _updateEstimate() {
@@ -369,18 +434,19 @@ export class NavEngine {
     this.state.spread = est.spread;
     this.state.edge = est.edge;
     this.state.s = est.s;
-    this.state.mode = (this.motion.ready || this.state.source === 'gps') ? 'tracking' : 'calibrating';
+    this.state.mode = (this.motion.ready || this.state.source === 'gps' || this.state.source === 'wifi' || this.state.coasting) ? 'tracking' : 'calibrating';
 
     // У режимі GPS малюємо фікс, а не хмару — хмара лишається напоготові для офлайну.
     const g = this.gpsSnap;
-    if (g && this.state.source === 'gps' && this.now() - g.t < 5) {
+    const src = this.state.source;
+    if (g && ((src === 'gps' && this.now() - g.t < 5) || (src === 'wifi' && this.now() - g.t < this.leadLostAfter))) {
       this.state.xy = g.xy;
       this.state.latlon = this.proj.toLL(g.xy[0], g.xy[1]);
       if (g.hdg !== null) this.state.heading = g.hdg;
       else if (g.e >= 0) this.state.heading = this.g.hdg[g.e];
       this.state.spread = Math.max(6, g.acc);
       this.state.confidence = Math.max(this.state.confidence, 0.9);
-      if (g.e >= 0) { this.state.edge = g.e; this.state.s = g.s; }
+      if (g.e >= 0) { this.state.edge = this.g.edge(g.e); this.state.s = g.s; }
     }
   }
 }

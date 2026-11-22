@@ -809,7 +809,7 @@ async function autoStart() {
   updateMotionChip();
 }
 
-function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; Awake.off(); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
+function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; Awake.off(); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch != null) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
 function onMotion(e) {
   const ag = e.accelerationIncludingGravity, rr = e.rotationRate;
   if (!ag || ag.x == null || !rr || rr.alpha == null) return;
@@ -818,25 +818,66 @@ function onMotion(e) {
   const D2R = Math.PI / 180;
   S.engine.pushMotion({ t, acc: [ag.x, ag.y, ag.z], gyro: [rr.beta * D2R, rr.gamma * D2R, rr.alpha * D2R] });
 }
+// ---------- позиція від системи ----------
+// Усі фікси (і до того, як карта завантажилась) ідуть сюди. Кожен пишемо в журнал позицій —
+// це сирі дані від iOS: з них видно, що саме телефон дає під час тривоги.
+const geoQueue = [];
+const FIXLOG_KEY = 'navi.fixlog';
+S.fixLog = (() => { try { return JSON.parse(localStorage.getItem(FIXLOG_KEY) || '[]'); } catch { return []; } })();
+function feedFix(pos, via) {
+  const c = pos.coords;
+  S.lastAnyFixAt = Date.now(); S.lastFixAcc = c.accuracy; S.lastGeoErr = '';
+  const f = { t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading };
+  if (S.engine) S.engine.pushGps(f); else geoQueue.push(f);
+  const st = S.engine?.state;
+  S.fixLog.push([Date.now(), +c.latitude.toFixed(6), +c.longitude.toFixed(6), Math.round(c.accuracy),
+    c.speed == null || c.speed < 0 ? '' : +c.speed.toFixed(1), c.heading == null || c.heading < 0 ? '' : Math.round(c.heading),
+    via, st?.source || '', st?.gps || '']);
+  if (S.fixLog.length > 3000) S.fixLog.splice(0, 800);
+}
+setInterval(() => { try { localStorage.setItem(FIXLOG_KEY, JSON.stringify(S.fixLog)); } catch { S.fixLog.splice(0, 1500); } }, 20000);
+addEventListener('pagehide', () => { try { localStorage.setItem(FIXLOG_KEY, JSON.stringify(S.fixLog)); } catch { } });
+
+function geoErr(err) {
+  S.lastGeoErr = geoErrText(err); S.lastGeoErrAt = Date.now();
+  S.fixLog.push([Date.now(), '', '', '', '', '', 'err' + err.code, S.engine?.state?.source || '', '']);
+  if (err.code === 1) { $('txtGps').textContent = 'Геолокація заборонена'; $('dotGps').className = 'dot bad'; }
+}
+
+function startWatch() {
+  if (!('geolocation' in navigator)) return;
+  if (S.gpsWatch != null) navigator.geolocation.clearWatch(S.gpsWatch);
+  S.watchStartedAt = Date.now();
+  S.gpsWatch = navigator.geolocation.watchPosition((pos) => { S.lastFixAt = Date.now(); feedFix(pos, 'w'); }, geoErr,
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+}
+
+// Стартує одразу при відкритті, ще до завантаження карти: позиція приходить паралельно з даними.
+function earlyGeo() {
+  if (!('geolocation' in navigator) || S.gpsWatch != null) return;
+  // Найшвидша відповідь — позиція, яку iOS уже знає (до 5 хв давнини); потім уточнюється.
+  navigator.geolocation.getCurrentPosition((p) => feedFix(p, 'f'), () => { }, { enableHighAccuracy: false, maximumAge: 300000, timeout: 5000 });
+  startWatch();
+}
+
 function startGps() {
   if (!('geolocation' in navigator)) { $('txtGps').textContent = 'Геолокація недоступна'; return; }
-  // 1) Спершу просимо грубу позицію: її iOS бере з веж зв'язку та Wi-Fi, без супутників.
-  //    Вона приходить за секунду-дві й працює там, де РЕБ глушить GPS.
+  // 1) Позиція, яку система визначає без супутників (Wi-Fi, вежі) — приходить за секунду-дві.
   findMe(true);
-  // 2) Паралельно — звичайне стеження з максимальною точністю (супутники, коли є).
-  S.gpsWatch = navigator.geolocation.watchPosition((pos) => {
-    const c = pos.coords;
-    S.lastFixAt = Date.now();
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading });
-  }, (err) => {
-    S.lastGeoErr = geoErrText(err);
-    if (err.code === 1) { $('txtGps').textContent = 'Геолокація заборонена'; $('dotGps').className = 'dot bad'; }
-  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
-  // 3) Кожні 25 с перепитуємо грубу позицію — це незалежне джерело, яким можна
-  //    і підстрахувати дрейф, і впіймати підміну координат.
+  // 2) Стеження з максимальною точністю. Якщо вже запущене при відкритті — не дублюємо.
+  if (S.gpsWatch == null) startWatch();
+  // 3) Кожні 20 с — окремий запит позиції: незалежна підстраховка, коли стеження «засинає».
   clearInterval(S.netTimer);
-  S.netTimer = setInterval(() => locateByNetwork(false), 25000);
+  S.netTimer = setInterval(() => locateByNetwork(false), 20000);
 }
+
+// Сторож: iOS іноді мовчки перестає слати позицію (особливо після помилки «час вийшов»).
+// Якщо 25 с нічого не приходило — перезапускаємо стеження.
+setInterval(() => {
+  if (!S.sensorsOn || !('geolocation' in navigator)) return;
+  const quiet = Date.now() - Math.max(S.lastAnyFixAt || 0, S.watchStartedAt || 0);
+  if (quiet > 25000) { stage('geo:restart'); startWatch(); locateByNetwork(false); }
+}, 5000);
 
 // Чому не вийшло — зрозумілим текстом, а не кодом помилки
 function geoErrText(err) {
@@ -849,13 +890,12 @@ function geoErrText(err) {
 // Що прийде першим, те й показуємо; точна потім уточнить тихо.
 function findMe(announce = true) {
   if (!('geolocation' in navigator)) { toast('Геолокація недоступна в цьому браузері'); return; }
-  if (!S.engine) { toast('Карта ще завантажується'); return; }
   if (announce) toast('Шукаю вас…');
   let answered = false;
   const ok = (pos) => {
     const c = pos.coords;
-    S.lastNetAt = Date.now(); S.lastGeoErr = '';
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading });
+    S.lastNetAt = Date.now();
+    feedFix(pos, 'f');
     S.follow = true;
     if (announce && !answered) {
       answered = true;
@@ -867,30 +907,30 @@ function findMe(announce = true) {
     }
     draw();
   };
-  const fail = (err) => { S.lastGeoErr = geoErrText(err); if (announce && !answered) { answered = true; toast(S.lastGeoErr); } };
-  navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy: false, maximumAge: 30000, timeout: 15000 });
-  navigator.geolocation.getCurrentPosition(ok, () => { }, { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 });
+  const fail = (err) => { geoErr(err); if (announce && !answered) { answered = true; toast(S.lastGeoErr); } };
+  navigator.geolocation.getCurrentPosition(ok, fail, { enableHighAccuracy: false, maximumAge: 60000, timeout: 8000 });
+  navigator.geolocation.getCurrentPosition(ok, () => { }, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
 }
 
 // Груба позиція «по мережі»: enableHighAccuracy:false просить систему не вмикати
 // супутниковий приймач, тож відповідь приходить від веж зв'язку / Wi-Fi.
 function locateByNetwork(initial) {
-  if (!('geolocation' in navigator)) return;
+  if (!('geolocation' in navigator) || S.netPending) return;
   S.netPending = true;
   navigator.geolocation.getCurrentPosition((pos) => {
     S.netPending = false;
     const c = pos.coords;
     S.lastNetAt = Date.now();
-    S.engine.pushGps({ t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: null, heading: null });
+    feedFix(pos, 'n');
     if (initial) {
       const a = Math.round(c.accuracy);
       toast(a <= 40 ? 'Позицію визначено по супутниках' : `Позицію визначено по мережі зв'язку, ±${a < 1000 ? a + ' м' : (a / 1000).toFixed(1) + ' км'} — уточню під час руху`);
       S.follow = true;
     }
   }, (err) => {
-    S.netPending = false;
+    S.netPending = false; geoErr(err);
     if (initial && err.code !== 1) toast('Позицію по мережі визначити не вдалося — вкажіть її кнопкою «Я тут»');
-  }, { enableHighAccuracy: false, maximumAge: initial ? 60000 : 10000, timeout: 20000 });
+  }, { enableHighAccuracy: false, maximumAge: initial ? 60000 : 5000, timeout: 15000 });
 }
 
 let wakeLock = null;
@@ -1171,6 +1211,8 @@ function updateTrailInfo() {
     'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
     'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
     'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
+    (() => { const n10 = S.fixLog.filter(r => r[1] !== '' && Date.now() - r[0] < 600000); const acc = n10.map(r => r[3]).sort((a, b) => a - b);
+      return `позиція: останній фікс ${S.lastAnyFixAt ? Math.round((Date.now() - S.lastAnyFixAt) / 1000) + ' с тому, ±' + Math.round(S.lastFixAcc) + ' м' : 'ще не було'}; за 10 хв ${n10.length} фіксів` + (acc.length ? `, похибка медіана ${acc[acc.length >> 1]} м` : '') + (S.lastGeoErr ? `; помилка: ${S.lastGeoErr.slice(0, 60)}` : ''); })(),
     'рушій пошуку: ' + (window.NAVI_RLVL >= 1 ? 'JS (запасний)' : 'WebAssembly — ' + (S.wasmState || '—') + (S.wasm ? `, ${S.wasm.memoryMB} МБ` : '')) + (S.engineUsed ? ` · востаннє: ${S.engineUsed}` : ''),
     'економія пам\'яті: ' + (ECO() ? 'так' : 'ні'),
     localStorage.getItem('navi.memtest') ? `тест пам'яті: ${localStorage.getItem('navi.memtest')}` : null,
@@ -1236,6 +1278,20 @@ $('btnAutoRec').addEventListener('click', () => {
   updateRecInfo();
 });
 
+$('btnFixLog')?.addEventListener('click', async () => {
+  if (!S.fixLog.length) { toast('Журнал позицій порожній'); return; }
+  const head = 'час,lat,lon,похибка_м,швидкість_мс,курс,звідки,режим,стан\n';
+  const csv = head + S.fixLog.map(r => [new Date(r[0]).toISOString(), ...r.slice(1)].join(',')).join('\n');
+  const name = `navi-pozycii-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`;
+  const file = new File([csv], name, { type: 'text/csv' });
+  try {
+    if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: 'Журнал позицій Наві' }); return; }
+  } catch (e) { if (e.name === 'AbortError') return; }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+});
+$('btnFixLogClear')?.addEventListener('click', () => { S.fixLog.length = 0; try { localStorage.removeItem(FIXLOG_KEY); } catch { } toast('Журнал позицій очищено'); });
+
 $('btnRec').addEventListener('click', () => {
   const log = S.engine ? S.engine.exportLog() : [];
   if (!log.length) { toast('Записувати ще нічого — увімкніть датчики руху й проїдьте трохи'); return; }
@@ -1280,17 +1336,21 @@ function updateStatus() {
   $('speed').textContent = (st.source === 'gps' || !S.sensorsOn) ? String(kmh) : '≈' + kmh;
   if (S.sensorsOn) { eng.updateSource(); eng.coastTick(); updateMotionChip(); }
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
+  const fixAge = S.lastAnyFixAt ? Math.round((Date.now() - S.lastAnyFixAt) / 1000) : null;
+  const ageTxt = fixAge !== null && fixAge >= 8 ? ` · ${fixAge < 120 ? fixAge + ' с' : Math.round(fixAge / 60) + ' хв'} без даних` : '';
   const gpsTxt = {
-    none: 'Позиції нема', ok: 'Супутники', weak: 'Wi-Fi / слабкий сигнал',
+    none: S.sensorsOn ? 'Шукаю позицію…' : 'Позиції нема', ok: 'Супутники',
+    wifi: `Wi-Fi/вежі ±${Math.round(st.leadAcc || S.lastFixAcc || 0)} м`,
+    weak: 'Wi-Fi / слабкий сигнал', lost: 'Сигналу позиції нема',
     net: netAcc ? `Мережа зв'язку ±${netAcc}` : "Мережа зв'язку",
     coarse: st.hint ? `Лише приблизно ±${(st.hint.acc / 1000).toFixed(1)} км` : 'Лише приблизно',
     rejected: st.spoofByNet ? 'ПІДМІНА (не збігається з мережею)' : 'ПІДМІНА — ігнорую',
     jammed: netAcc ? `GPS глушиться · мережа ±${netAcc}` : 'GPS глушиться',
   }[st.gps] || '—';
-  $('txtGps').textContent = gpsTxt;
-  $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' ? 'bad' : '');
+  $('txtGps').textContent = gpsTxt + (st.gps === 'ok' ? '' : ageTxt);
+  $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' || st.gps === 'wifi' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' || st.gps === 'lost' ? 'bad' : '');
   let modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду' }[st.mode] || st.mode;
-  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : (st.coasting ? 'офлайн: веду за швидкістю' : 'офлайн: датчики + карта');
+  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : st.source === 'wifi' ? 'веду по Wi-Fi/мережі' : (st.coasting ? 'наосліп: за останньою швидкістю' : 'офлайн: датчики + карта');
   $('txtMode').textContent = modeTxt;
   $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? (st.source === 'gps' ? 'ok' : 'warn') : st.mode === 'calibrating' ? 'warn' : '');
   // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами
@@ -1344,11 +1404,13 @@ function loop(now) {
 
 // ---------- старт ----------
 (async function main() {
+  earlyGeo();   // позиція шукається паралельно із завантаженням карти
   const { graph, fuel, real } = await loadData();
   S.graph = graph; S.fuel = fuel;
   S.traffic = new TrafficMemory(`${graph.meta?.name || 'map'}|${graph.nNodes}|${graph.n}`);
   updateTrafficInfo();
   S.engine = new NavEngine(S.graph, { motion: { gravitySign: IS_IOS ? -1 : 1 } });
+  if (real) { for (const f of geoQueue.splice(0)) S.engine.pushGps(f); if (S.engine.state.xy) S.follow = true; } else geoQueue.length = 0;
   S.voice = new Voice(); $('voiceState').textContent = S.voice.enabled ? 'увімкнено' : 'вимкнено';
   // центр карти: остання збережена позиція, інакше опорна точка (центр Києва) або середина тестового міста
   const saved = JSON.parse(localStorage.getItem('navi.view') || 'null');
@@ -1374,3 +1436,4 @@ function loop(now) {
   const seen = localStorage.getItem('navi.seen');
   if (!seen) { hint('Застосунок уже шукає вас. Торкніться екрана — увімкнуться датчики руху, і він вестиме по них і по карті, навіть коли GPS глушать. «Пошук» — адреси та АЗС.'); localStorage.setItem('navi.seen', '1'); setTimeout(() => hint(''), 14000); }
 })();
+window.NAVI_BOOTED = 1;   // сторожу в index.html: модулі завантажились і код запустився
