@@ -19,6 +19,12 @@ export class GraphParticleFilter {
     this.uturnProb = opts.uturnProb ?? 0.02;
     this.p = [];
     this._snaps = [];
+    // Множник швидкості в кожної частинки (k). Без GPS швидкість відома лише приблизно (типова для
+    // дороги), тож кожна гіпотеза їде зі своїм темпом; повороти на перехрестях (гіроскоп) лишають
+    // ті, що приїхали до перехрестя вчасно, — так швидкість «вчиться» без інтегрування акселерометра.
+    this.kSpread = 0;            // розкид k для нових частинок (0 = як є, з GPS)
+    this.routeSet = null;        // ребра активного маршруту: водій найімовірніше їде ним
+    this.offRoutePenalty = 0.95;
     this.reseedOnSurprise = opts.reseedOnSurprise ?? false;
     this.roughen = opts.roughen ?? false;
   }
@@ -36,7 +42,7 @@ export class GraphParticleFilter {
       // ребер у порядку сітки, тобто один кут кола.
       const c = cands[Math.floor(this.rng() * cands.length)];
       const s = Math.max(0, Math.min(c.edge.len, c.s + randn(this.rng) * 15));
-      this.p.push({ e: c.edge.id, s, turn: 0, w: Math.exp(-(c.d * c.d) / (2 * (r / 2) ** 2)) });
+      this.p.push({ e: c.edge.id, s, turn: 0, k: this._newK(), w: Math.exp(-(c.d * c.d) / (2 * (r / 2) ** 2)) });
     }
     this._normalize();
     return true;
@@ -65,7 +71,9 @@ export class GraphParticleFilter {
       // гіроскоп: + ліворуч (проти годинникової). Курс ребра hdg: 0=північ, за годинниковою.
       // Тож поворот ліворуч ЗМЕНШУЄ hdg: ожидана зміна hdg = -dψ
       q.turn += -dpsi;
-      let rem = d * (1 + this.distNoise * randn(this.rng)) + 0.3 * randn(this.rng);
+      if (this.kSpread > 0) q.k = Math.max(0.35, Math.min(2.2, (q.k ?? 1) * Math.exp(0.015 * randn(this.rng))));
+      const kq = this.kSpread > 0 ? (q.k ?? 1) : 1;
+      let rem = d * kq * (1 + this.distNoise * randn(this.rng)) + 0.3 * randn(this.rng);
       if (rem < 0) rem = 0;
       let e = g.edge(q.e);
       let guard = 0;
@@ -100,6 +108,7 @@ export class GraphParticleFilter {
           if (best !== null) { q.e = best; q.s = 0; q.turn = angleDiff(predicted, g.hdg[best]); e = g.edge(best); }
         }
       }
+      if (this.routeSet && !this.routeSet.has(q.e)) q.w *= this.offRoutePenalty;
       // на прямому ребрі авто не має крутити: штраф за накопичений поворот
       if (e.len > 25) {
         const over = Math.max(0, Math.abs(q.turn) - 0.15);
@@ -133,7 +142,7 @@ export class GraphParticleFilter {
     const wNew = 1 / this.p.length;
     for (const i of idx) {
       const c = cands[Math.floor(this.rng() * cands.length)];
-      this.p[i] = { e: c.edge.id, s: this.rng() * c.edge.len, turn: 0, w: wNew };
+      this.p[i] = { e: c.edge.id, s: this.rng() * c.edge.len, turn: 0, k: this._newK(), w: wNew };
     }
     this._normalize();
     return true;
@@ -150,7 +159,7 @@ export class GraphParticleFilter {
     const wNew = Math.max(1e-6, 0.5 / this.p.length);
     for (const i of idx) {
       const c = cands[Math.floor(this.rng() * cands.length)];
-      this.p[i] = { e: c.edge.id, s: this.rng() * c.edge.len, turn: 0, w: wNew };
+      this.p[i] = { e: c.edge.id, s: this.rng() * c.edge.len, turn: 0, k: this._newK(), w: wNew };
     }
     this._normalize();
   }
@@ -215,6 +224,29 @@ export class GraphParticleFilter {
     this._resample();
   }
 
+  _newK() {
+    if (!(this.kSpread > 0)) return 1;
+    return Math.max(0.35, Math.min(2.2, Math.exp(this.kSpread * randn(this.rng))));
+  }
+  // Увімкнути/вимкнути розкид швидкостей (втрата GPS / його повернення)
+  diversifySpeed(sigma) {
+    this.kSpread = sigma;
+    for (const q of this.p) q.k = this._newK();
+  }
+  collapseSpeed() { this.kSpread = 0; for (const q of this.p) q.k = 1; }
+  kMean() {
+    if (!this.p.length || !(this.kSpread > 0)) return 1;
+    let s = 0, w = 0; for (const q of this.p) { s += q.w * (q.k ?? 1); w += q.w; }
+    return w > 0 ? s / w : 1;
+  }
+  // Незалежний вимір швидкості (з повороту, з Wi-Fi-фіксів): гіпотези з близьким темпом важчають.
+  weightBySpeed(vBase, vMeas, sigma) {
+    if (!(this.kSpread > 0) || !(vBase > 0.5)) return;
+    for (const q of this.p) { const d = (q.k ?? 1) * vBase - vMeas; q.w *= Math.exp(-(d * d) / (2 * sigma * sigma)) + 0.02; }
+    this._normalize();
+    if (this._neff() < this.N / 3) this._resample();
+  }
+
   _normalize() {
     let s = 0; for (const q of this.p) s += q.w;
     if (s <= 0 || !isFinite(s)) { for (const q of this.p) q.w = 1 / this.p.length; return; }
@@ -228,7 +260,7 @@ export class GraphParticleFilter {
     for (let m = 0; m < n; m++) {
       while (u > c && i < src - 1) { i++; c += this.p[i].w; }
       const q = this.p[i];
-      out.push({ e: q.e, s: q.s, turn: q.turn, w: 1 / n });
+      out.push({ e: q.e, s: q.s, turn: q.turn, k: q.k ?? 1, w: 1 / n });
       u += 1 / n;
     }
     this.p = out;

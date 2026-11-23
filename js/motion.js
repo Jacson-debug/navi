@@ -56,15 +56,21 @@ export class MotionProcessor {
     this.lvlMoving = null;
     this.turnSpeedEst = null;
     this.distance = 0;
+    this._aHF = 0; this._yawTF = 0;   // згладжені |горизонтальне прискорення| і кутова швидкість — для швидкості з повороту
+    this._tiltF = 0;                  // обертання навколо горизонтальних осей: телефон беруть у руки
+    this.handledUntil = -1e9;
   }
 
-  get ready() { return !!(this.up && this.fwd); }
+  // Для ведення потрібна лише вертикаль (з неї — поворот авто з гіроскопа). Напрямок «вперед»
+  // більше не обов'язковий: швидкість з акселерометра не інтегруємо (див. нижче).
+  get ready() { return !!this.up; }
 
   pushSample(s) {
     if (this.t === null) { this.t = s.t; this.g = s.acc.slice(); this.up = v3.unit(v3.scale(this.g, this.gravitySign)); return null; }
     let dt = s.t - this.t;
     if (dt <= 0 || dt > 1) { this.t = s.t; return null; }
     this.t = s.t;
+    this._age = (this._age || 0) + dt;
 
     const gyro = v3.sub(s.gyro, this.gyroBias);
 
@@ -85,6 +91,13 @@ export class MotionProcessor {
     const tau = this.stationary ? 0.5 : (accelerating ? 300 : 10);
     const a = 1 - Math.exp(-dt / tau);
     this.g = v3.add(v3.scale(this.g, 1 - a), v3.scale(s.acc, a));
+    // iOS сама ділить прискорення на гравітацію й рух (Core Motion, з компенсацією зсуву гіроскопа).
+    // Якщо таке розділення є — беремо його: власна оцінка вертикалі на справжньому телефоні «пливла»,
+    // через неї рівень вібрації завищувався, і зупинки не розпізнавались.
+    if (s.lin) {
+      const gOS = v3.sub(s.acc, s.lin), gn = v3.norm(gOS);
+      if (gn > 7 && gn < 12.5) { this.g = gOS; this.osGravity = true; }
+    }
     this.up = v3.unit(v3.scale(this.g, this.gravitySign));
 
     // лінійне прискорення без гравітації та його горизонтальна складова
@@ -136,6 +149,23 @@ export class MotionProcessor {
     // --- швидкість обертання навколо вертикалі (+ = проти годинникової = ліворуч) ---
     this.yawRate = v3.dot(gyro, this.up);
 
+    // Телефон взяли в руки / він перекинувся: авто так не крутиться (крен і тангаж авто — частки рад/с).
+    const tilt = v3.norm(v3.sub(gyro, v3.scale(this.up, this.yawRate)));
+    this._tiltF = lp(this._tiltF, tilt, dt, 0.25);
+    if (this._tiltF > 0.7) this.handledUntil = this.t + 2.5;
+    const handled = this.t < this.handledUntil;
+
+    // Швидкість з повороту: доцентрове прискорення a = v·ω, тож v = a/ω. Не потрібні ні осі «вперед»,
+    // ні інтегрування — лише модуль горизонтального прискорення і кутова швидкість. Шум вібрації віднімаємо.
+    this._aHF = lp(this._aHF, v3.norm(linH), dt, 0.6);
+    this._yawTF = lp(this._yawTF, this.yawRate, dt, 0.6);
+    let vTurn = null;
+    if (!this.stationary && !handled && Math.abs(this._yawTF) > 0.22) {
+      const aCorr = Math.sqrt(Math.max(0, this._aHF * this._aHF - (0.8 * this._lvl) ** 2));
+      const v = aCorr / Math.abs(this._yawTF);
+      if (v > 1.5 && v < 22) vTurn = v;
+    }
+
     // --- напрямок «вперед»: голосування за домінантний горизонтальний напрямок під час розгону/гальмування ---
     const hMag = v3.norm(linH);
     if (!this.stationary && hMag > 1.2 && Math.abs(this.yawRate) < 0.08) {
@@ -150,7 +180,7 @@ export class MotionProcessor {
         this.fwdConfidence = Math.min(1, vn / 10);
       }
     }
-    if (!this.fwd) return { dt, speed: 0, yawRate: this.yawRate, stationary: this.stationary, ready: false };
+    if (!this.fwd) return { dt, speed: 0, yawRate: this.yawRate, stationary: this.stationary, ready: true, vTurn, handled };
 
     this.fwd = v3.unit(v3.sub(this.fwd, v3.scale(this.up, v3.dot(this.fwd, this.up))));
     const right = v3.cross(this.fwd, this.up);
@@ -185,7 +215,7 @@ export class MotionProcessor {
       }
     }
     this.distance += this.speed * dt;
-    return { dt, speed: this.speed, yawRate: this.yawRate, stationary: this.stationary, ready: true, aFwd, aLat };
+    return { dt, speed: this.speed, yawRate: this.yawRate, stationary: this.stationary, ready: true, aFwd, aLat, vTurn, handled };
   }
 
   // Жорстко задати швидкість (надійний GPS). Інтегратор повністю переставляється,
@@ -195,9 +225,12 @@ export class MotionProcessor {
     if (v > 2) { this.gpsMoveUntil = (this.t ?? 0) + 6; this.stillTime = 0; this.stationary = false; }
     else if (v < 0.5) { this.gpsMoveUntil = 0; }
     // вчимо рівень вібрації для свого авто й тримача
-    const k = 0.06;
-    if (v < 0.5) this.lvlParked = this.lvlParked === null ? this._lvl : this.lvlParked * (1 - k) + this._lvl * k;
-    else if (v > 5) this.lvlMoving = this.lvlMoving === null ? this._lvl : this.lvlMoving * (1 - k) + this._lvl * k;
+    // Перші секунди після старту датчиків вертикаль ще не встановилась — рівні тоді неправдиві.
+    const k = 0.08;
+    if (this._age > 5) {
+      if (v < 0.5) this.lvlParked = this.lvlParked === null ? this._lvl : this.lvlParked * (1 - k) + Math.min(this._lvl, this.lvlParked * 1.5) * k;
+      else if (v > 5) this.lvlMoving = this.lvlMoving === null ? this._lvl : this.lvlMoving * (1 - k) + this._lvl * k;
+    }
     if (this.speed > 1 && v > 1) {
       const ratio = v / this.speed;
       if (ratio > 0.4 && ratio < 2.5) {

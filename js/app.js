@@ -650,7 +650,7 @@ async function routeTo(f) {
     return;
   }
   stage('route:instructions');
-  S.routeInfo = r; S.target = f; S.routeSteps = instructions(g, r); S.lastSpoken = null;
+  S.routeInfo = r; S.target = f; S.routeSteps = instructions(g, r); S.lastSpoken = null; S.engine?.setRoute(r.edges);
   S.follow = true;
   const km = (r.length / 1000).toFixed(1), min = Math.max(1, Math.round(r.time / 60));
   toast(`${f.name || 'Маршрут'} · ${km} км · ~${min} хв`);
@@ -686,7 +686,7 @@ function updateTurn() {
       const to = S.routeInfo ? S.routeInfo.nodes[S.routeInfo.nodes.length - 1] : g.nearestNode([S.target.x, S.target.y]);
       S.routing = true;
       findRoute(st.edge.b, to, { maxExpand: 150000, timeoutMs: 5000 })
-        .then(r => { if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; toast('Перебудовую маршрут'); } })
+        .then(r => { if (r) { S.routeInfo = r; S.routeSteps = instructions(g, r); S.lastSpoken = null; S.engine?.setRoute(r.edges); toast('Перебудовую маршрут'); } })
         .catch(e => logErr('rebuild: ' + e.message))
         .finally(() => { S.routing = false; });
     }
@@ -723,7 +723,7 @@ function updateTurn() {
   }
   if (d < 30 && turnKey === 'end') {
     toast('Ви на місці'); S.voice?.say('Ви прибули', 'arrive', 0);
-    S.routeInfo = null; S.target = null; S.pin = null; el.classList.remove('show');
+    S.routeInfo = null; S.engine?.setRoute(null); S.target = null; S.pin = null; el.classList.remove('show');
     if (ECO() && !S.bld && !S.bldLoading) setTimeout(() => loadBuildings(), 1500);
   }
 }
@@ -811,12 +811,14 @@ async function autoStart() {
 
 function stopSensors() { removeEventListener('devicemotion', onMotion); S.motionOn = false; motionArmed = false; Awake.off(); clearInterval(S.netTimer); S.netTimer = null; S.sensorsOn = false; markRunning(false); if (S.gpsWatch != null) navigator.geolocation.clearWatch(S.gpsWatch); S.gpsWatch = null; }
 function onMotion(e) {
-  const ag = e.accelerationIncludingGravity, rr = e.rotationRate;
+  const ag = e.accelerationIncludingGravity, rr = e.rotationRate, la = e.acceleration;
   if (!ag || ag.x == null || !rr || rr.alpha == null) return;
   const t = (e.timeStamp || performance.now()) / 1000;
   // W3C: rotationRate.alpha — навколо z, beta — навколо x, gamma — навколо y (град/с)
   const D2R = Math.PI / 180;
-  S.engine.pushMotion({ t, acc: [ag.x, ag.y, ag.z], gyro: [rr.beta * D2R, rr.gamma * D2R, rr.alpha * D2R] });
+  // acceleration — рух без гравітації, вже відділений системою (Core Motion): точніша вертикаль
+  const lin = la && la.x != null ? [la.x, la.y, la.z] : null;
+  S.engine.pushMotion({ t, acc: [ag.x, ag.y, ag.z], lin, gyro: [rr.beta * D2R, rr.gamma * D2R, rr.alpha * D2R] });
 }
 // ---------- позиція від системи ----------
 // Усі фікси (і до того, як карта завантажилась) ідуть сюди. Кожен пишемо в журнал позицій —
@@ -1333,7 +1335,8 @@ function updateStatus() {
   // Без GPS швидкість — оцінка з датчиків і карти, а не вимір. Показуємо її з «≈»,
   // щоб число не читалося як точне: акселерометр принципово не бачить сталої швидкості.
   const kmh = Math.round(st.speed * 3.6);
-  $('speed').textContent = (st.source === 'gps' || !S.sensorsOn) ? String(kmh) : '≈' + kmh;
+  // Точна цифра — лише від супутників. Інакше це оцінка: округлюємо до 5 і чесно ставимо «≈».
+  $('speed').textContent = st.source === 'gps' ? String(kmh) : (kmh < 3 ? '0' : '≈' + Math.max(5, Math.round(kmh / 5) * 5));
   if (S.sensorsOn) { eng.updateSource(); eng.coastTick(); updateMotionChip(); }
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
   const fixAge = S.lastAnyFixAt ? Math.round((Date.now() - S.lastAnyFixAt) / 1000) : null;
@@ -1350,7 +1353,11 @@ function updateStatus() {
   $('txtGps').textContent = gpsTxt + (st.gps === 'ok' ? '' : ageTxt);
   $('dotGps').className = 'dot ' + (st.gps === 'ok' ? 'ok' : st.gps === 'weak' || st.gps === 'net' || st.gps === 'wifi' ? 'warn' : st.gps === 'rejected' || st.gps === 'jammed' || st.gps === 'lost' ? 'bad' : '');
   let modeTxt = { init: 'немає позиції', hint: 'уточніть «Я тут»', calibrating: 'калібрую осі…', tracking: 'веду' }[st.mode] || st.mode;
-  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : st.source === 'wifi' ? 'веду по Wi-Fi/мережі' : (st.coasting ? 'наосліп: за останньою швидкістю' : 'офлайн: датчики + карта');
+  if (st.mode === 'tracking') modeTxt = st.source === 'gps' ? 'веду по GPS' : st.source === 'wifi' ? 'веду по Wi-Fi/мережі'
+    : st.coasting ? 'наосліп: за останньою швидкістю'
+    : st.handled ? 'наосліп: телефон у руках — повороти не рахую'
+    : st.stopped ? 'наосліп: стоїмо' : 'наосліп: датчики + карта';
+  if (!st.xy && st.spoof) modeTxt = 'GPS підмінено — вкажіть себе «Я тут»';
   $('txtMode').textContent = modeTxt;
   $('dotMode').className = 'dot ' + (st.mode === 'tracking' ? (st.source === 'gps' ? 'ok' : 'warn') : st.mode === 'calibrating' ? 'warn' : '');
   // Частка ваги найкращої дороги мало що каже людині — показуємо радіус і стан словами

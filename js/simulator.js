@@ -24,8 +24,12 @@ export function simulateDrive(graph, fromNode, toNode, opts = {}) {
   const ios = opts.ios ?? true;            // конвенція знаку акселерометра
   const R = opts.R ?? rotationMatrix(0.4, 1.1, -0.2); // телефон у кріпленні
   const accNoise = opts.accNoise ?? 0.18, gyrNoise = opts.gyrNoise ?? 0.012;
-  const accBias = [0.06, -0.04, 0.03].map(b => b * (opts.biasScale ?? 1));
-  const gyrBias = [0.002, -0.003, 0.0025].map(b => b * (opts.biasScale ?? 1));
+  // «Жорсткий» режим — ближче до справжнього iPhone у машині: великий і повзучий зсув акселерометра,
+  // помітний зсув гіроскопа, вібрація двигуна на холостому ходу, вибоїни.
+  const harsh = !!opts.harsh;
+  const accBias = harsh ? [0, 0, 0].map(() => (rng() - 0.5) * 0.8) : [0.06, -0.04, 0.03].map(b => b * (opts.biasScale ?? 1));
+  const gyrBias = harsh ? [0, 0, 0].map(() => (rng() - 0.5) * 0.02) : [0.002, -0.003, 0.0025].map(b => b * (opts.biasScale ?? 1));
+  const accDrift = [0, 0, 0];
   const stopProb = opts.stopProb ?? 0.35;
 
   const r = route(graph, fromNode, toNode);
@@ -39,7 +43,8 @@ export function simulateDrive(graph, fromNode, toNode, opts = {}) {
     const vmax = Math.min(cruise, FREE[ge.cls] ?? cruise) * (ge.jam ?? 1);
     segs.push({ a: pts[i], b: pts[i + 1], len: dist(pts[i], pts[i + 1]), hdg: hdgOf(pts[i], pts[i + 1]), vmax: Math.max(2, vmax) });
   }
-  const stops = segs.map(() => rng() < stopProb ? 2 + rng() * 6 : 0); // зупинка на початку сегмента i (перехрестя)
+  // зупинка на початку сегмента i (перехрестя). У «жорсткому» режимі — як справжні світлофори: 10–50 с.
+  const stops = segs.map(() => rng() < stopProb ? (opts.harsh ? (rng() < 0.6 ? 10 + rng() * 40 : 2 + rng() * 6) : 2 + rng() * 6) : 0);
 
   const truth = [], samples = [];
   let t = 0, v = 0, si = 0, s = 0; // поточний сегмент і відстань на ньому
@@ -94,12 +99,20 @@ export function simulateDrive(graph, fromNode, toNode, opts = {}) {
     // система авто: x вправо, y вперед, z вгору. Доцентрове: поворот ліворуч (ω>0) → прискорення ліворуч (x<0)
     const aCar = [-v * omega, a, 0];
     const f = [aCar[0], aCar[1], aCar[2] + 9.81];           // питома сила (W3C: показ датчика)
-    const vib = v > 0.3 ? 0.3 + 0.03 * v : 0;              // вібрація двигуна/дороги росте зі швидкістю
-    const fPhone = toPhone(R, f).map((x, i) => x + accBias[i] + (accNoise + vib) * randn(rng));
+    const vib = v > 0.3 ? 0.3 + 0.03 * v : (harsh ? 0.07 : 0);   // вібрація дороги росте зі швидкістю; холостий хід
+    if (harsh) for (let i = 0; i < 3; i++) accDrift[i] = Math.max(-0.3, Math.min(0.3, accDrift[i] + 0.004 * randn(rng)));
+    const bump = harsh && v > 3 && rng() < 0.002 ? 2.5 * randn(rng) : 0;
+    const fPhone = toPhone(R, f).map((x, i) => x + accBias[i] + accDrift[i] + (i === 2 ? bump : 0) + (accNoise + vib) * randn(rng));
     const acc = ios ? fPhone.map(x => -x) : fPhone;
+    // Як iOS: окремо «рух без гравітації» (Core Motion) — з невеликою похибкою вертикалі й шумом.
+    let lin = null;
+    if (opts.osFusion) {
+      const lp = toPhone(R, aCar).map((x, i) => x + (vib + 0.03) * randn(rng) + (i === 2 ? bump : 0) + 0.03 * Math.sin(t / 40 + i));
+      lin = ios ? lp.map(x => -x) : lp;
+    }
     const wCar = [0.02 * randn(rng) * (v > 0.3 ? 1 : 0), 0.02 * randn(rng) * (v > 0.3 ? 1 : 0), omega];
     const gyro = toPhone(R, wCar).map((x, i) => x + gyrBias[i] + gyrNoise * randn(rng));
-    samples.push({ t, acc, gyro });
+    samples.push(lin ? { t, acc, gyro, lin } : { t, acc, gyro });
     truth.push({ t, x: pos[0], y: pos[1], v, hdg, seg: si });
     t += dt;
   }
