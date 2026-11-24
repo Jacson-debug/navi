@@ -71,7 +71,7 @@ export class NavEngine {
     this.pendingDist += vBase * r.dt;
     if (r.vTurn != null) { this._vTurnSum = (this._vTurnSum || 0) + r.vTurn; this._vTurnN = (this._vTurnN || 0) + 1; }
     if (!gpsFresh) {
-      const k = src === 'dr' ? this.pf.kMean() : 1;
+      const k = src === 'dr' ? Math.max(0.6, Math.min(1.5, this.pf.kMean())) : 1;
       this._showSpeed(vBase * k, r.dt);
     }
     if (this.lastStepT === null) { this.lastStepT = sample.t; this.lastStepHeading = this.gyroHeading; }
@@ -114,14 +114,23 @@ export class NavEngine {
     const cur = this.state.speed || 0;
     const up = 3.5 * dt, down = 8 * dt;
     let v = target > cur ? Math.min(target, cur + up) : Math.max(target, cur - down);
-    if (this.state.edge) v = Math.min(v, EDGE_SPEED_CAP[this.g.level(this.state.edge.id)] || 36);
+    if (this.state.edge) {
+      const lvl = this.g.level(this.state.edge.id);
+      // Без супутників швидкість — оцінка; вона не може бути більшою за реальну для цієї вулиці.
+      const cap = this.state.source === 'gps' ? (EDGE_SPEED_CAP[lvl] || 36) : Math.min(EDGE_SPEED_CAP[lvl] || 36, (TYPICAL_SPEED[lvl] || 11) * 1.7);
+      v = Math.min(v, cap);
+    }
     this.state.speed = Math.max(0, v);
   }
 
   // Виміряна швидкість від фіксів — з перевіркою на фізику: стрибок 0→130 за 2 с відкидаємо як шум.
-  _setMeasuredSpeed(v, kind) {
+  _setMeasuredSpeed(v, kind, trusted = false) {
     if (!(v >= 0) || !isFinite(v)) return;
     const now = this.now();
+    // Для сумнівних вимірів (Wi-Fi, слабкий фікс) — медіана трьох останніх за 8 с: поодинокий викид
+    // (стрибок фіксу, вигадана iOS швидкість) її не зрушить. Добрий супутниковий фікс — як є, без затримки.
+    this._vRaw = (this._vRaw || []).filter(r => now - r[0] < 8); this._vRaw.push([now, v]);
+    if (!trusted && this._vRaw.length >= 3) { const l = this._vRaw.slice(-3).map(r => r[1]).sort((a, b) => a - b); v = l[1]; }
     v = Math.min(v, kind === 'gnss' ? 55 : 36);
     if (this.vMeasT && now - this.vMeasT < 10) {
       const dtm = Math.max(0.3, now - this.vMeasT);
@@ -169,7 +178,11 @@ export class NavEngine {
     // Перший фікс будь-якої якості задає початкове коло пошуку.
     if (!this.pf.p.length) {
       this.state.hint = null;
-      this.pf.initAround(xy, Math.max(40, Math.min(acc * 1.2, 3000)));
+      // Якщо поруч доріг нема (ви в глибині кварталу, у дворі, у великому ТЦ) — розширюємо коло.
+      // Раніше тут гіпотез не з'являлося зовсім, і кожен наступний фікс падав з помилкою.
+      let ok = false;
+      for (const r of [Math.max(40, Math.min(acc * 1.2, 3000)), 150, 400, 1000]) { if (this.pf.initAround(xy, r)) { ok = true; break; } }
+      if (!ok) { this.state.hint = { xy, acc: Math.max(acc, 300), t: fix.t }; this.state.mode = 'hint'; return; }
       this.state.mode = 'tracking';
       if (kind === 'net') {
         this.state.gps = 'net';
@@ -250,7 +263,8 @@ export class NavEngine {
     // Історія фіксів за 40 с — швидкість і курс там, де система їх не дає (Wi-Fi).
     this.hist.push({ t: fix.t, xy });
     while (this.hist.length > 2 && fix.t - this.hist[0].t > 40) this.hist.shift();
-    let vFix = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed)) ? fix.speed : null;
+    // Швидкість від iOS (доплер) — лише від хорошого фіксу: під глушінням вона буває вигадана.
+    let vFix = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed) && acc <= 20) ? fix.speed : null;
     const minSpan = kind === 'gnss' ? 0.3 : 4;
     // для Wi-Fi беремо найдавніший фікс у межах 25 с — шум ±65 м на 5 с дав би фантомні 40 км/год
     let ref = null;
@@ -295,11 +309,16 @@ export class NavEngine {
     this.gpsSnap = m
       ? { xy: m.point.slice(), e: m.edge.id, s: m.s, len: m.edge.len, hdg, acc, t: now, kind }
       : { xy: xy.slice(), e: -1, s: 0, len: 0, hdg, acc, t: now, kind };
+    // Фікс приходить із запізненням (iOS ~0.5–1.5 с): одразу «доганяємо» його на цю відстань, інакше
+    // точка щоразу відскакує назад і потім знову наздоганяє.
+    this._snapLag = Math.max(0, Math.min(2, fix.lag ?? 0));
 
     if (vFix !== null) {
       if (m && kind !== 'gnss') vFix = Math.min(vFix, EDGE_SPEED_CAP[this.g.level(m.edge.id)] || 30);
-      this._setMeasuredSpeed(vFix, kind);
-      this.motion.setSpeed(this.vMeas);          // вчить пороги вібрації «стою/їду» під це авто
+      const trusted = kind === 'gnss' && acc <= 15;
+      this._setMeasuredSpeed(vFix, kind, trusted);
+      // пороги вібрації «стою/їду» вчимо лише від надійної швидкості — інакше вони псуються
+      if (trusted) this.motion.setSpeed(this.vMeas);
       if (kind === 'gnss') this.state.speed = this.vMeas; else this._showSpeed(this.vMeas, 1);
       this.coastV = this.vMeas;
       if (kind === 'wifi' && this.pf.kSpread > 0) this.pf.weightBySpeed(this.vMeas || 1, this.vMeas, 4);
@@ -474,11 +493,12 @@ export class NavEngine {
     const src = this.state.source;
     if (!g || g.e < 0 || !(dt > 0) || (src !== 'gps' && src !== 'wifi')) return;
     if (this.now() - g.t > (src === 'gps' ? 8 : this.leadLostAfter)) return;
-    let ds = this.state.speed * dt;
+    let ds = this.state.speed * (dt + (this._snapLag || 0));
+    this._snapLag = 0;
     if (!(ds > 0)) return;
     // Між рідкими Wi-Fi-фіксами їдемо далі за перехрестя — найпрямішим продовженням.
     let guard = 0;
-    while (g.s + ds > g.len && src === 'wifi' && guard++ < 8) {
+    while (g.s + ds > g.len && guard++ < 8) {
       ds -= g.len - g.s;
       const outs = this.g.outEdges(this.g.b[g.e]);
       let nb = -1, bd = 1e9;

@@ -428,10 +428,11 @@ function draw() {
   // «правда» в демо
   // позиція
   if (eng && eng.state.xy) {
-    const st = eng.state; const p = worldToScreen(...st.xy);
+    const st = eng.state; const p = worldToScreen(...(S.disp || st.xy));
     const spread = Math.min(300, st.spread) * v.scale * DPR;
     if (spread > 10 * DPR) { ctx.fillStyle = 'rgba(77,163,255,.12)'; ctx.beginPath(); ctx.arc(p[0], p[1], spread, 0, 7); ctx.fill(); }
-    const a = worldToScreen(st.xy[0] + Math.sin(st.heading), st.xy[1] + Math.cos(st.heading));
+    const dxy = S.disp || st.xy;
+    const a = worldToScreen(dxy[0] + Math.sin(st.heading), dxy[1] + Math.cos(st.heading));
     const ang = Math.atan2(a[1] - p[1], a[0] - p[0]);
     ctx.save(); ctx.translate(p[0], p[1]); ctx.rotate(ang);
     ctx.fillStyle = st.spoof ? '#ffb020' : '#4da3ff'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2 * DPR;
@@ -829,7 +830,8 @@ S.fixLog = (() => { try { return JSON.parse(localStorage.getItem(FIXLOG_KEY) || 
 function feedFix(pos, via) {
   const c = pos.coords;
   S.lastAnyFixAt = Date.now(); S.lastFixAcc = c.accuracy; S.lastGeoErr = '';
-  const f = { t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading };
+  const f = { t: pos.timestamp / 1000, lat: c.latitude, lon: c.longitude, accuracy: c.accuracy, speed: c.speed, heading: c.heading,
+    lag: Math.max(0, Math.min(3, Date.now() / 1000 - pos.timestamp / 1000)) };
   if (S.engine) S.engine.pushGps(f); else geoQueue.push(f);
   const st = S.engine?.state;
   S.fixLog.push([Date.now(), +c.latitude.toFixed(6), +c.longitude.toFixed(6), Math.round(c.accuracy),
@@ -1367,7 +1369,14 @@ function updateStatus() {
     const word = st.spread < 40 && st.confidence > 0.5 ? 'точно' : st.spread < 150 ? 'приблизно' : 'уточнюю';
     $('conf').textContent = `${word} ±${r}`;
   }
-  if (S.follow && st.xy) { S.view.cx += (st.xy[0] - S.view.cx) * 0.3; S.view.cy += (st.xy[1] - S.view.cy) * 0.3; applyAutoZoom(st.speed); }
+  // Плавний показ: точка не стрибає туди-сюди на кожному фіксі, а «підтягується» за ~0.3 с.
+  // Великий стрибок (>120 м — нова позиція, «Я тут») показуємо одразу.
+  if (st.xy) {
+    const tNow = performance.now() / 1000, dtd = Math.min(0.5, tNow - (S.dispT || tNow)); S.dispT = tNow;
+    if (!S.disp || Math.hypot(st.xy[0] - S.disp[0], st.xy[1] - S.disp[1]) > 120) S.disp = st.xy.slice();
+    else { const a = 1 - Math.exp(-dtd / 0.3); S.disp = [S.disp[0] + (st.xy[0] - S.disp[0]) * a, S.disp[1] + (st.xy[1] - S.disp[1]) * a]; }
+  } else S.disp = null;
+  if (S.follow && st.xy) { const d = S.disp || st.xy; S.view.cx += (d[0] - S.view.cx) * 0.3; S.view.cy += (d[1] - S.view.cy) * 0.3; applyAutoZoom(st.speed); }
   else if (S.follow && st.hint && !S.hintShown) {
     // показуємо коло цілком, щоб було видно, про яку частину області йдеться
     S.hintShown = true;

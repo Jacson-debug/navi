@@ -254,6 +254,7 @@ export class GraphParticleFilter {
   }
   _neff() { let s = 0; for (const q of this.p) s += q.w * q.w; return 1 / s; }
   _resample() {
+    if (!this.p.length) return;   // гіпотез ще нема (поруч не знайшлося доріг) — нічого перерозподіляти
     const n = this.N, out = [];
     const src = this.p.length;
     let u = this.rng() / n, c = this.p[0].w, i = 0;
