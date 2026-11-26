@@ -11,7 +11,7 @@
 // Швидкість за класом дороги (м/с) — для режиму «найшвидший маршрут».
 // Порядок класів як у graph.js: service, living_street, residential, road, unclassified,
 // tertiary, secondary, primary, trunk, motorway
-export const ASTAR_VERSION = '0.8.26';
+export const ASTAR_VERSION = '0.8.27';
 export const FREEFLOW_BY_CLS = new Float32Array(16).fill(9);
 FREEFLOW_BY_CLS.set([20, 15, 30, 30, 35, 40, 45, 50, 70, 90].map(v => v / 3.6));
 

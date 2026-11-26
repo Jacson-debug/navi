@@ -168,10 +168,24 @@ export class NavEngine {
       this.gpsTrust = 0; this.lastKind = 'spoof';
       return;
     }
-    const kind = acc <= 40 ? 'gnss' : acc <= 250 ? 'wifi' : acc <= 3000 ? 'net'
+    // Справжній супутниковий фікс iOS приходить зі швидкістю (і курсом, коли їдемо). Wi-Fi-позиція —
+    // без них, навіть якщо iOS пише похибку 25–40 м. Так було в журналі тривоги: «±38 м» без швидкості —
+    // це Wi-Fi, а не GPS; раніше через них програма перемикалась «GPS ↔ Wi-Fi» і показ стрибав.
+    const hasSpeed = fix.speed != null && fix.speed >= 0 && isFinite(fix.speed);
+    const kind = (acc <= 15 || (acc <= 40 && hasSpeed)) ? 'gnss' : acc <= 250 ? 'wifi' : acc <= 3000 ? 'net'
       : acc <= 50000 ? 'coarse' : 'junk';
     this.lastKind = kind; this.lastAcc = acc; this.lastAnyWall = this.now();
     if (kind === 'junk') return;
+    // iOS під тривогою повертає старі позиції: ту саму координату з новим часом (часто ще й з «розмитою»
+    // похибкою 480 → 1300 м) або давню, що вже була кілька хвилин тому. Нової інформації в них нема.
+    if (kind !== 'gnss' && kind !== 'coarse') {
+      const key = fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6), nowW = this.now();
+      this._seen = this._seen || new Map();
+      const first = this._seen.get(key);
+      if (first !== undefined) { this.state.staleFixes = (this.state.staleFixes || 0) + 1; this.lastFixWall = nowW; return; }
+      this._seen.set(key, nowW);
+      if (this._seen.size > 3000) { for (const [k, v] of this._seen) { if (nowW - v > 900) this._seen.delete(k); } }
+    }
 
     if (kind === 'coarse') {
       this.state.hint = { xy, acc, t: fix.t };
@@ -209,8 +223,10 @@ export class NavEngine {
       if (this.state.xy) {
         const leadFresh = this.now() - Math.max(this.lastGnssWall, this.lastWifiWall) < this.leadLostAfter;
         const off = dist(this.state.xy, xy);
-        if (!leadFresh && off > acc * 0.6) this.pf.reseedAround(xy, acc, 0.6);
-        if (!leadFresh) this.pf.weightByPosition(xy, acc * 0.6);
+        // iOS завищує похибку «веж»: у журналі тривоги центр кола ±1400 м був ~200 м від справжнього місця.
+        const rEff = Math.min(acc * 0.6, 600);
+        if (!leadFresh && off > rEff) this.pf.reseedAround(xy, Math.min(acc, 700), 0.6);
+        if (!leadFresh) this.pf.weightByPosition(xy, Math.min(acc * 0.5, 450));
         this._updateEstimate();
       }
       return;
@@ -218,12 +234,6 @@ export class NavEngine {
 
     // iOS під час глушіння часто віддає ту саму стару Wi-Fi-позицію знову і знову з новим часом.
     // Це не нова інформація: не тягнемо до неї точку і не вважаємо Wi-Fi «живим».
-    if (kind === 'wifi') {
-      const rep = this._lastWifiXY && dist(xy, this._lastWifiXY) < 2.5;
-      this._lastWifiXY = xy;
-      if (rep) { this.state.wifiRepeat = (this.state.wifiRepeat || 0) + 1; this.lastFixWall = this.now(); return; }
-      this.state.wifiRepeat = 0;
-    }
 
     // --- точний (gnss) або Wi-Fi-фікс: перевіряємо на підміну ---
     let plausible = true;
@@ -281,9 +291,9 @@ export class NavEngine {
     // Стоїмо в заторі? Порівнюємо центри Wi-Fi-фіксів першої й другої половини останніх 16 с:
     // поодинокі фікси стрибають на десятки метрів, а середнє — ні. Якщо центр не зсувається — ми стоїмо.
     if (kind === 'wifi') {
-      const win = this.hist.filter(h => fix.t - h.t <= 16);
+      const win = this.hist.filter(h => fix.t - h.t <= 30);
       this._wifiStill = false;
-      if (win.length >= 4 && win[win.length - 1].t - win[0].t >= 10) {
+      if (win.length >= 3 && win[win.length - 1].t - win[0].t >= 12) {
         const mid = (win[0].t + win[win.length - 1].t) / 2, a = win.filter(h => h.t <= mid), b = win.filter(h => h.t > mid);
         const c = (arr) => [arr.reduce((p, h) => p + h.xy[0], 0) / arr.length, arr.reduce((p, h) => p + h.xy[1], 0) / arr.length];
         if (a.length && b.length && dist(c(a), c(b)) < Math.max(15, 0.35 * acc)) { this._wifiStill = true; vFix = 0; }
@@ -297,11 +307,22 @@ export class NavEngine {
     for (const h of this.hist) { if (fix.t - h.t <= winW && fix.t - h.t >= minSpan) { ref = h; break; } }
     if (ref) {
       const d = dist(xy, ref.xy), dtf = fix.t - ref.t;
-      const noise = kind === 'gnss' ? 0 : Math.min(acc, 80) * 0.8;
-      if (vFix === null) { const v = Math.max(0, d - noise) / dtf; if (v < 55) vFix = kind === 'gnss' ? v : (this.state.speed > 0 ? 0.5 * this.state.speed + 0.5 * v : v); }
-      if (hdg === null && d > Math.max(kind === 'gnss' ? 15 : 30, noise * 1.5)) hdg = Math.atan2(xy[0] - ref.xy[0], xy[1] - ref.xy[1]);
+      // Шум двох Wi-Fi-фіксів віднімаємо «в квадратурі»: просте віднімання занижувало швидкість на третину
+      // (у журналі тривоги точка повзла 5–15 км/год, коли авто їхало 40).
+      const noise = kind === 'gnss' ? 0 : Math.min(acc, 100) * 0.6;
+      const dCorr = Math.sqrt(Math.max(0, d * d - noise * noise));
+      if (vFix === null) { const v = dCorr / dtf; if (v < 55) vFix = kind === 'gnss' ? v : (this.state.speed > 0 ? 0.4 * this.state.speed + 0.6 * v : v); }
+      if (hdg === null && d > Math.max(kind === 'gnss' ? 15 : 30, noise)) hdg = Math.atan2(xy[0] - ref.xy[0], xy[1] - ref.xy[1]);
     }
 
+    if (hdg === null && kind === 'wifi' && this.hist.length >= 3) {
+      const old = this.hist.filter(h => fix.t - h.t <= 30);
+      if (old.length >= 3) {
+        const k = Math.max(1, Math.floor(old.length / 2)), c = (arr) => [arr.reduce((p, h) => p + h.xy[0], 0) / arr.length, arr.reduce((p, h) => p + h.xy[1], 0) / arr.length];
+        const a = c(old.slice(0, k)), b = c(old.slice(-k));
+        if (dist(a, b) > Math.max(30, acc * 0.5)) hdg = Math.atan2(b[0] - a[0], b[1] - a[1]);
+      }
+    }
     // Частинки: щільно до фікса; якщо далеко відійшли — пересіваємо, а не повземо хвилину.
     const sigma = kind === 'gnss' ? Math.max(12, acc * 0.6) : Math.max(20, acc * 0.7);
     if (this.gpsTrust >= 0.5 || kind === 'wifi') this.pf.weightByPosition(xy, sigma);
@@ -326,12 +347,41 @@ export class NavEngine {
         cost += Math.abs(d) * (kind === 'gnss' ? 60 : 40);
       }
       if (prevE >= 0 && kind === 'wifi') {
-        if (c.edge.id === prevE || this.g.a[c.edge.id] === this.g.b[prevE]) cost -= Math.min(30, acc * 0.4);
+        let okDir = true;
+        if (hdg !== null) { let d2 = c.edge.hdg - hdg; while (d2 > Math.PI) d2 -= 2 * Math.PI; while (d2 <= -Math.PI) d2 += 2 * Math.PI; okDir = Math.abs(d2) < Math.PI / 2; }
+        if (okDir && (c.edge.id === prevE || this.g.a[c.edge.id] === this.g.b[prevE])) cost -= Math.min(30, acc * 0.4);
         else if (this.g.rev[prevE] === c.edge.id) cost += 25;
       }
       if (!best || cost < best.cost) best = { cost, c };
     }
-    const m = best && best.c;
+    let m = best && best.c;
+    // Wi-Fi: замість стрибка до кожного фіксу — зважуємо прогноз (куди ми доїхали) і фікс за їхньою
+    // точністю (одновимірний фільтр Калмана), і лише результат кладемо на дорогу.
+    if (kind === 'wifi' && m && this.gpsSnap && this.gpsSnap.e >= 0 && this.state.source === 'wifi' && now - this.gpsSnap.t < this.leadLostAfter) {
+      const pred = this.gpsSnap.xy, dtp = now - this.gpsSnap.t;
+      const sp = 15 + 3.5 * dtp, sf = Math.max(20, acc * 0.6);
+      const dd = dist(pred, m.point);
+      // Великий розрив: один фікс може бути викидом (у журналі ±144 м «стрибнув» на 300 м і назад),
+      // тож перший раз зсуваємося на третину, а повністю — коли другий фікс підтвердить.
+      let K = (sp * sp) / (sp * sp + sf * sf);
+      if (dd > 3 * sf + sp) {
+        const prevBig = this._bigDisc && fix.t - this._bigDisc.t < 15 && dist(this._bigDisc.xy, xy) < 1.5 * (this._bigDisc.acc + acc) / 2 + 30;
+        K = prevBig ? 1 : 0.35;
+        this._bigDisc = { t: fix.t, xy, acc };
+      } else this._bigDisc = null;
+      const bxy = [pred[0] + K * (m.point[0] - pred[0]), pred[1] + K * (m.point[1] - pred[1])];
+      let bb = null;
+      // Напрямок руху: курс із фіксів або напрям «прогноз → фікс». На двосторонній вулиці це єдине,
+      // що відрізняє «туди» від «назад» (у журналі точку інколи несло у зворотний бік).
+      const dirH = hdg !== null ? hdg : (dd > 40 ? Math.atan2(m.point[0] - pred[0], m.point[1] - pred[1]) : null);
+      for (const c of this.g.edgesNear(bxy, 40)) {
+        let cost = c.d, ang = 0;
+        if (dirH !== null) { ang = c.edge.hdg - dirH; while (ang > Math.PI) ang -= 2 * Math.PI; while (ang <= -Math.PI) ang += 2 * Math.PI; ang = Math.abs(ang); cost += ang * 40; }
+        if (ang < Math.PI / 2 && (c.edge.id === this.gpsSnap.e || this.g.a[c.edge.id] === this.g.b[this.gpsSnap.e] || c.edge.id === m.edge.id)) cost -= 15;
+        if (!bb || cost < bb.cost) bb = { cost, c };
+      }
+      if (bb) m = bb.c;
+    }
     this.gpsSnap = m
       ? { xy: m.point.slice(), e: m.edge.id, s: m.s, len: m.edge.len, hdg, acc, t: now, kind }
       : { xy: xy.slice(), e: -1, s: 0, len: 0, hdg, acc, t: now, kind };

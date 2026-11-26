@@ -939,7 +939,7 @@ function locateByNetwork(initial) {
   }, (err) => {
     S.netPending = false; geoErr(err);
     if (initial && err.code !== 1) toast('Позицію по мережі визначити не вдалося — вкажіть її кнопкою «Я тут»');
-  }, { enableHighAccuracy: false, maximumAge: initial ? 60000 : 5000, timeout: 15000 });
+  }, { enableHighAccuracy: false, maximumAge: initial ? 60000 : 0, timeout: 15000 });   // періодично — лише свіжа позиція, не кешована
 }
 
 let wakeLock = null;
