@@ -93,13 +93,17 @@ export class NavEngine {
     }
   }
 
+  _sensorsLive(now = this.now()) { return !!(this.lastMotionWall && now - this.lastMotionWall < 1.5 && this.motion.ready); }
+
   // З якою швидкістю (м/с) котити гіпотези зараз.
   _driveSpeed(now, stopped) {
     if (stopped) return 0;
     const src = this.state.source;
     const age = this.vMeasT ? now - this.vMeasT : 1e9;
     if (src === 'gps' && age < 3) return this.vMeas;
-    if (src === 'wifi' && age < 15) return this.vMeas;
+    if (src === 'wifi' && age < 15) {
+      return this._wifiStill ? 0 : this.vMeas;
+    }
     // Наосліп: остання виміряна швидкість поволі (≈2 хв) переходить у типову для цієї дороги.
     // Кожна частинка ще й множить її на свій k — справжній темп відбирають повороти.
     const lvl = this.state.edge ? this.g.level(this.state.edge.id) : 3;
@@ -212,6 +216,15 @@ export class NavEngine {
       return;
     }
 
+    // iOS під час глушіння часто віддає ту саму стару Wi-Fi-позицію знову і знову з новим часом.
+    // Це не нова інформація: не тягнемо до неї точку і не вважаємо Wi-Fi «живим».
+    if (kind === 'wifi') {
+      const rep = this._lastWifiXY && dist(xy, this._lastWifiXY) < 2.5;
+      this._lastWifiXY = xy;
+      if (rep) { this.state.wifiRepeat = (this.state.wifiRepeat || 0) + 1; this.lastFixWall = this.now(); return; }
+      this.state.wifiRepeat = 0;
+    }
+
     // --- точний (gnss) або Wi-Fi-фікс: перевіряємо на підміну ---
     let plausible = true;
     if (this.lastGoodGps) {
@@ -265,10 +278,23 @@ export class NavEngine {
     while (this.hist.length > 2 && fix.t - this.hist[0].t > 40) this.hist.shift();
     // Швидкість від iOS (доплер) — лише від хорошого фіксу: під глушінням вона буває вигадана.
     let vFix = (fix.speed != null && fix.speed >= 0 && isFinite(fix.speed) && acc <= 20) ? fix.speed : null;
+    // Стоїмо в заторі? Порівнюємо центри Wi-Fi-фіксів першої й другої половини останніх 16 с:
+    // поодинокі фікси стрибають на десятки метрів, а середнє — ні. Якщо центр не зсувається — ми стоїмо.
+    if (kind === 'wifi') {
+      const win = this.hist.filter(h => fix.t - h.t <= 16);
+      this._wifiStill = false;
+      if (win.length >= 4 && win[win.length - 1].t - win[0].t >= 10) {
+        const mid = (win[0].t + win[win.length - 1].t) / 2, a = win.filter(h => h.t <= mid), b = win.filter(h => h.t > mid);
+        const c = (arr) => [arr.reduce((p, h) => p + h.xy[0], 0) / arr.length, arr.reduce((p, h) => p + h.xy[1], 0) / arr.length];
+        if (a.length && b.length && dist(c(a), c(b)) < Math.max(15, 0.35 * acc)) { this._wifiStill = true; vFix = 0; }
+      }
+    } else this._wifiStill = false;
     const minSpan = kind === 'gnss' ? 0.3 : 4;
     // для Wi-Fi беремо найдавніший фікс у межах 25 с — шум ±65 м на 5 с дав би фантомні 40 км/год
     let ref = null;
-    for (const h of this.hist) { if (fix.t - h.t <= (kind === 'gnss' ? 10 : 25) && fix.t - h.t >= minSpan) { ref = h; break; } }
+    // Wi-Fi: вікно 15 с (зупинку видно швидко), а якщо фікси рідкі — 30 с, щоб було хоч два виміри.
+    const winW = kind === 'gnss' ? 10 : (this.hist.filter(h => fix.t - h.t <= 15).length >= 3 ? 15 : 30);
+    for (const h of this.hist) { if (fix.t - h.t <= winW && fix.t - h.t >= minSpan) { ref = h; break; } }
     if (ref) {
       const d = dist(xy, ref.xy), dtf = fix.t - ref.t;
       const noise = kind === 'gnss' ? 0 : Math.min(acc, 80) * 0.8;
@@ -360,7 +386,8 @@ export class NavEngine {
     }
     if (was !== this.state.source) {
       if (this.state.source === 'dr' && (was === 'gps' || was === 'wifi')) this._enterBlind(now);
-      else if (this.state.source === 'gps' || this.state.source === 'wifi') this.pf.collapseSpeed();
+      else if (this.state.source === 'gps') this.pf.collapseSpeed();
+      else if (this.state.source === 'wifi') this.pf.collapseSpeed();
     }
     return this.state.source;
   }
@@ -493,6 +520,7 @@ export class NavEngine {
     const src = this.state.source;
     if (!g || g.e < 0 || !(dt > 0) || (src !== 'gps' && src !== 'wifi')) return;
     if (this.now() - g.t > (src === 'gps' ? 8 : this.leadLostAfter)) return;
+    if (src === 'wifi' && (this._wifiStill || this.state.stopped)) { this._snapLag = 0; return; }   // стоїмо — точку не штовхаємо
     let ds = this.state.speed * (dt + (this._snapLag || 0));
     this._snapLag = 0;
     if (!(ds > 0)) return;

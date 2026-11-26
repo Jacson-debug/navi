@@ -840,6 +840,11 @@ function feedFix(pos, via) {
   if (S.fixLog.length > 3000) S.fixLog.splice(0, 800);
 }
 setInterval(() => { try { localStorage.setItem(FIXLOG_KEY, JSON.stringify(S.fixLog)); } catch { S.fixLog.splice(0, 1500); } }, 20000);
+// Якщо в журналі за добу вже є поїздка без GPS (наприклад, сьогоднішня тривога) — одразу запропонувати надіслати.
+try {
+  if (localStorage.getItem('navi.alarmLogSeen') !== '0.8.26' && S.fixLog.some(r => Date.now() - r[0] < 86400000 && (r[7] === 'wifi' || r[7] === 'dr'))) localStorage.setItem('navi.alarmLog', '1');
+  localStorage.setItem('navi.alarmLogSeen', '0.8.26');
+} catch { }
 addEventListener('pagehide', () => { try { localStorage.setItem(FIXLOG_KEY, JSON.stringify(S.fixLog)); } catch { } });
 
 function geoErr(err) {
@@ -1282,18 +1287,31 @@ $('btnAutoRec').addEventListener('click', () => {
   updateRecInfo();
 });
 
-$('btnFixLog')?.addEventListener('click', async () => {
-  if (!S.fixLog.length) { toast('Журнал позицій порожній'); return; }
+async function shareFixLog() {
+  if (!S.fixLog.length) { toast('Журнал позицій порожній'); return false; }
   const head = 'час,lat,lon,похибка_м,швидкість_мс,курс,звідки,режим,стан\n';
   const csv = head + S.fixLog.map(r => [new Date(r[0]).toISOString(), ...r.slice(1)].join(',')).join('\n');
   const name = `navi-pozycii-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.csv`;
   const file = new File([csv], name, { type: 'text/csv' });
   try {
-    if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: 'Журнал позицій Наві' }); return; }
-  } catch (e) { if (e.name === 'AbortError') return; }
+    if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: 'Журнал позицій Наві' }); return true; }
+  } catch (e) { if (e.name === 'AbortError') return false; }
   const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = name;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  return true;
+}
+$('btnFixLog')?.addEventListener('click', () => shareFixLog());
+// Після поїздки без GPS (хвилина й більше) — помітна кнопка надіслати журнал: з нього видно, що iPhone давав.
+$('alarmLogChip')?.addEventListener('click', async () => {
+  if (await shareFixLog()) { S.alarmShared = true; try { localStorage.removeItem('navi.alarmLog'); } catch { } $('alarmLogChip').style.display = 'none'; }
 });
+function updateAlarmLogChip(st) {
+  const now = Date.now();
+  if (st.source && st.source !== 'gps' && st.source !== 'none') { S.noGpsSince = S.noGpsSince || now; if (now - S.noGpsSince > 60000 && !S.alarmShared) { try { localStorage.setItem('navi.alarmLog', '1'); } catch { } } }
+  else if (st.source === 'gps') { S.noGpsSince = 0; S.alarmShared = false; }
+  let flag = false; try { flag = localStorage.getItem('navi.alarmLog') === '1'; } catch { }
+  const c = $('alarmLogChip'); if (c) c.style.display = flag ? '' : 'none';
+}
 $('btnFixLogClear')?.addEventListener('click', () => { S.fixLog.length = 0; try { localStorage.removeItem(FIXLOG_KEY); } catch { } toast('Журнал позицій очищено'); });
 
 $('btnRec').addEventListener('click', () => {
@@ -1339,7 +1357,7 @@ function updateStatus() {
   const kmh = Math.round(st.speed * 3.6);
   // Точна цифра — лише від супутників. Інакше це оцінка: округлюємо до 5 і чесно ставимо «≈».
   $('speed').textContent = st.source === 'gps' ? String(kmh) : (kmh < 3 ? '0' : '≈' + Math.max(5, Math.round(kmh / 5) * 5));
-  if (S.sensorsOn) { eng.updateSource(); eng.coastTick(); updateMotionChip(); }
+  if (S.sensorsOn) { eng.updateSource(); eng.coastTick(); updateMotionChip(); updateAlarmLogChip(st); }
   const netAcc = st.net ? (st.net.acc < 1000 ? Math.round(st.net.acc) + ' м' : (st.net.acc / 1000).toFixed(1) + ' км') : '';
   const fixAge = S.lastAnyFixAt ? Math.round((Date.now() - S.lastAnyFixAt) / 1000) : null;
   const ageTxt = fixAge !== null && fixAge >= 8 ? ` · ${fixAge < 120 ? fixAge + ' с' : Math.round(fixAge / 60) + ' хв'} без даних` : '';
@@ -1374,7 +1392,10 @@ function updateStatus() {
   if (st.xy) {
     const tNow = performance.now() / 1000, dtd = Math.min(0.5, tNow - (S.dispT || tNow)); S.dispT = tNow;
     if (!S.disp || Math.hypot(st.xy[0] - S.disp[0], st.xy[1] - S.disp[1]) > 120) S.disp = st.xy.slice();
-    else { const a = 1 - Math.exp(-dtd / 0.3); S.disp = [S.disp[0] + (st.xy[0] - S.disp[0]) * a, S.disp[1] + (st.xy[1] - S.disp[1]) * a]; }
+    else {
+      const dx = st.xy[0] - S.disp[0], dy = st.xy[1] - S.disp[1];
+      const a = 1 - Math.exp(-dtd / 0.3); S.disp = [S.disp[0] + dx * a, S.disp[1] + dy * a];
+    }
   } else S.disp = null;
   if (S.follow && st.xy) { const d = S.disp || st.xy; S.view.cx += (d[0] - S.view.cx) * 0.3; S.view.cy += (d[1] - S.view.cy) * 0.3; applyAutoZoom(st.speed); }
   else if (S.follow && st.hint && !S.hintShown) {
