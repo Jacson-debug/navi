@@ -104,13 +104,32 @@ export class NavEngine {
     if (src === 'wifi' && age < 15) {
       return this._wifiStill ? 0 : this.vMeas;
     }
-    // Наосліп: остання виміряна швидкість поволі (≈2 хв) переходить у типову для цієї дороги.
+    // Наосліп рух вигадувати не можна: без доказу, що авто їде (виміряна швидкість за останні 2 хв
+    // або вібрація рівня «їду», вивчена з GPS), точка стоїть. Інакше вона «їхала» 50 км/год, коли
+    // телефон лежав в офісі.
+    if (!this._movingEvidence(now)) return 0;
+    // Остання виміряна швидкість поволі (≈2 хв) переходить у типову для цієї дороги.
     // Кожна частинка ще й множить її на свій k — справжній темп відбирають повороти.
     const lvl = this.state.edge ? this.g.level(this.state.edge.id) : 3;
     const prior = TYPICAL_SPEED[lvl] || 11;
     const last = this.vMeas > 2 ? this.vMeas : prior;
     const w = Math.exp(-age / 120);
     return w * last + (1 - w) * prior;
+  }
+
+  // Чи є докази, що авто зараз їде: свіжа виміряна швидкість, або дорожня вібрація з телефоном,
+  // що не крутиться в руках (у тримачі крен/тангаж малі), протягом кількох секунд поспіль.
+  _movingEvidence(now) {
+    if (this.vMeas > 2 && this.vMeasT && now - this.vMeasT < 120) return true;
+    if (!this._sensorsLive(now)) return false;
+    const m = this.motion;
+    const learned = m.lvlParked != null && m.lvlMoving != null && m.lvlMoving > m.lvlParked * 2;
+    const vib = learned ? m._lvl > m.lvlParked + 0.5 * (m.lvlMoving - m.lvlParked) : m._lvl > 0.12;
+    const steady = (m._tiltF ?? 1) < 0.25 && !this.state.handled;
+    if (vib && steady && !m.stationary) { if (!this._vibSince) this._vibSince = now; this._vibLast = now; }
+    else if (this._vibLast && now - this._vibLast > 2) this._vibSince = 0;
+    if (this._vibSince && now - this._vibSince > 4) this._vibMoveT = now;
+    return !!(this._vibMoveT && now - this._vibMoveT < 20);
   }
 
   // Показ швидкості: плавно і з фізичними межами (авто не розганяється на 50 км/год за секунду).
@@ -182,8 +201,28 @@ export class NavEngine {
       const key = fix.lat.toFixed(6) + ',' + fix.lon.toFixed(6), nowW = this.now();
       this._seen = this._seen || new Map();
       const first = this._seen.get(key);
-      if (first !== undefined) { this.state.staleFixes = (this.state.staleFixes || 0) + 1; this.lastFixWall = nowW; return; }
-      this._seen.set(key, nowW);
+      if (first !== undefined) {
+        // Та сама координата, що й щойно, без «розмивання» похибки — це «ви досі тут» (у приміщенні iOS
+        // так і робить). Не новий рух, але й не «сигналу нема»: тримаємо Wi-Fi живим і кажемо «стоїмо».
+        const L = this._lastNetFix;
+        if (L && L.key === key && acc <= L.acc * 1.3 + 5 && kind === 'wifi' && !this.state.spoof && !this._movingEvidence(nowW)) {
+          if (this.lastGoodGps) this.lastGoodGps.t = fix.t;      // місце підтверджене — це не «перерва»
+          this.prevCand = { t: fix.t, xy: this.proj.toXY(fix.lat, fix.lon), acc };
+          this.lastWifiWall = nowW; this.lastFixWall = nowW; L.acc = Math.min(L.acc, acc);
+          this._wifiStill = true; this._setMeasuredSpeed(0, 'wifi');
+          if (this.state.source !== 'gps') this.state.source = 'wifi';
+          this.state.gps = 'wifi'; this.state.leadAcc = acc;
+          return;
+        }
+        // Щойно відкинута координата повторилась — це другий узгоджений фікс: перевіряємо ще раз.
+        if (!(L && L.key === key && this.state.spoof)) {
+        // Давня координата, що повернулась, або та сама з «розмитою» похибкою — застаріла: ігноруємо.
+        this.state.staleFixes = (this.state.staleFixes || 0) + 1; this.lastFixWall = nowW; return;
+        }
+      } else {
+        this._seen.set(key, nowW);
+        this._lastNetFix = { key, acc };
+      }
       if (this._seen.size > 3000) { for (const [k, v] of this._seen) { if (nowW - v > 900) this._seen.delete(k); } }
     }
 
@@ -251,7 +290,7 @@ export class NavEngine {
     // стрибає по кілометру щосекунди. Приймаємо, лише коли два фікси поспіль узгоджені між собою.
     const cand = this.prevCand; this.prevCand = { t: fix.t, xy, acc };
     if (plausible && (!this.lastGoodGps || fix.t - this.lastGoodGps.t > 30) && this.pf.p.length && this.state.xy) {
-      if (!cand || fix.t - cand.t > 6 || dist(xy, cand.xy) > 50 * Math.max(0.5, fix.t - cand.t) + acc + cand.acc + 20) plausible = false;
+      if (!cand || fix.t - cand.t > 15 || dist(xy, cand.xy) > 35 * Math.max(0.5, fix.t - cand.t) + acc + cand.acc + 20) plausible = false;
     }
     // Перехресна перевірка вежами: РЕБ підміняє супутниковий сигнал, але не вежі зв'язку.
     if (plausible && kind === 'gnss' && this.lastNet && fix.t - this.lastNet.t < 180) {
@@ -309,7 +348,7 @@ export class NavEngine {
       const d = dist(xy, ref.xy), dtf = fix.t - ref.t;
       // Шум двох Wi-Fi-фіксів віднімаємо «в квадратурі»: просте віднімання занижувало швидкість на третину
       // (у журналі тривоги точка повзла 5–15 км/год, коли авто їхало 40).
-      const noise = kind === 'gnss' ? 0 : Math.min(acc, 100) * 0.6;
+      const noise = (kind === 'gnss' && hasSpeed) ? 0 : Math.min(acc, 100) * 0.6;   // без доплера — і для «GPS» шум враховуємо
       const dCorr = Math.sqrt(Math.max(0, d * d - noise * noise));
       if (vFix === null) { const v = dCorr / dtf; if (v < 55) vFix = kind === 'gnss' ? v : (this.state.speed > 0 ? 0.4 * this.state.speed + 0.6 * v : v); }
       if (hdg === null && d > Math.max(kind === 'gnss' ? 15 : 30, noise)) hdg = Math.atan2(xy[0] - ref.xy[0], xy[1] - ref.xy[1]);
