@@ -6,7 +6,7 @@ import { createWasmRouter, wasmSupported } from './wasm-route.js';
 import { dist, angleDiff } from './geo.js';
 import { TrafficMemory, trafficColor, VMAX } from './traffic.js';
 import { Buildings, normStreet, shortStreet } from './buildings.js';
-import { Voice, turnPhrase } from './voice.js';
+import { Voice, turnPhrase, audioSessionInfo } from './voice.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -1220,6 +1220,7 @@ function updateTrailInfo() {
     'wakeLock: ' + ('wakeLock' in navigator ? 'є' : 'нема') + ' · екран: ' + Awake.mode,
     'дані: граф ' + (S.graph ? 'є' : 'нема') + ', будинки ' + (S.bld ? 'є' : (S.bldLoading ? 'вантажаться' : 'НЕМА')) + ', місцевості ' + (S.places ? 'є' : 'нема'),
     'датчики руху: ' + (S.motionOn ? 'є' : 'нема') + ' · джерело: ' + (S.engine?.state?.source || '—'),
+    'звук: ' + audioSessionInfo() + ' (ambient — музика грає, transient — стишується на час підказки)',
     (() => { const n10 = S.fixLog.filter(r => r[1] !== '' && Date.now() - r[0] < 600000); const acc = n10.map(r => r[3]).sort((a, b) => a - b);
       return `позиція: останній фікс ${S.lastAnyFixAt ? Math.round((Date.now() - S.lastAnyFixAt) / 1000) + ' с тому, ±' + Math.round(S.lastFixAcc) + ' м' : 'ще не було'}; за 10 хв ${n10.length} фіксів` + (acc.length ? `, похибка медіана ${acc[acc.length >> 1]} м` : '') + (S.lastGeoErr ? `; помилка: ${S.lastGeoErr.slice(0, 60)}` : ''); })(),
     'рушій пошуку: ' + (window.NAVI_RLVL >= 1 ? 'JS (запасний)' : 'WebAssembly — ' + (S.wasmState || '—') + (S.wasm ? `, ${S.wasm.memoryMB} МБ` : '')) + (S.engineUsed ? ` · востаннє: ${S.engineUsed}` : ''),

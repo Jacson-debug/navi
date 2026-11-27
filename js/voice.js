@@ -1,5 +1,15 @@
 // Голосові підказки через вбудований синтезатор (працює офлайн, якщо в системі є український голос).
 // iOS: мовлення дозволяється лише після першої дії користувача — тому enable() викликаємо з кліку.
+//
+// Музика. За замовчуванням iOS вважає звук сторінки «відтворенням» і ставить чужу музику на паузу,
+// а після підказки сама її не повертає. Audio Session API (Safari 16.4+) дозволяє сказати iOS інакше:
+//   ambient   — у тиші звук сторінки змішується з музикою, нічого не перериває;
+//   transient — коротка підказка: музика на цей час лише стишується, потім повертається.
+// Тож тримаємо «ambient», а на час фрази вмикаємо «transient».
+
+const AS = (typeof navigator !== 'undefined' && navigator.audioSession) || null;
+function setSession(type) { try { if (AS && AS.type !== type) AS.type = type; } catch { } }
+export function audioSessionInfo() { return AS ? AS.type : 'немає (стара iOS)'; }
 
 export class Voice {
   constructor() {
@@ -7,6 +17,8 @@ export class Voice {
     this.ok = typeof speechSynthesis !== 'undefined' && typeof SpeechSynthesisUtterance !== 'undefined';
     this.voice = null;
     this.last = { key: '', t: 0 };
+    this._restore = null;
+    setSession('ambient');
     if (this.ok) { this._pick(); speechSynthesis.onvoiceschanged = () => this._pick(); }
   }
   _pick() {
@@ -14,9 +26,16 @@ export class Voice {
     this.voice = vs.find(v => /^uk/i.test(v.lang)) || vs.find(v => /ukrain/i.test(v.name)) || null;
     this.hasUk = !!this.voice;
   }
-  setEnabled(v) { this.enabled = v; localStorage.setItem('navi.voice', JSON.stringify(v)); if (!v && this.ok) speechSynthesis.cancel(); }
-  // «Розбудити» синтезатор з кліку (iOS)
-  warmup() { if (this.ok) { const u = new SpeechSynthesisUtterance(''); speechSynthesis.speak(u); } }
+  setEnabled(v) { this.enabled = v; localStorage.setItem('navi.voice', JSON.stringify(v)); if (!v && this.ok) { speechSynthesis.cancel(); this._done(); } }
+  // «Розбудити» синтезатор з кліку (iOS). Порожня фраза не повинна зупиняти музику.
+  warmup() { if (this.ok) { setSession('ambient'); const u = new SpeechSynthesisUtterance(''); speechSynthesis.speak(u); } }
+
+  // Фраза закінчилась: ще трохи тримаємо «стишення» (iOS повертає гучність із запізненням),
+  // далі повертаємо сесію в «ambient» — музика грає як раніше.
+  _done() {
+    clearTimeout(this._restore);
+    this._restore = setTimeout(() => { if (!speechSynthesis.speaking && !speechSynthesis.pending) setSession('ambient'); }, 700);
+  }
 
   say(text, key = text, minGap = 8) {
     if (!this.ok || !this.enabled || window.NAVI_SAFE) return;
@@ -24,12 +43,18 @@ export class Voice {
     if (key === this.last.key && now - this.last.t < minGap * 1000) return;
     this.last = { key, t: now };
     try {
+      clearTimeout(this._restore);
+      setSession('transient');            // музику не на паузу — лише стишити
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       if (this.voice) u.voice = this.voice;
       u.lang = 'uk-UA'; u.rate = 1.0;
+      u.onend = () => this._done();
+      u.onerror = () => this._done();
       speechSynthesis.speak(u);
-    } catch { }
+      // страховка: якщо iOS не надішле onend — повертаємо сесію за оцінкою тривалості фрази
+      this._restore = setTimeout(() => this._done(), 1500 + text.length * 90);
+    } catch { this._done(); }
   }
 }
 

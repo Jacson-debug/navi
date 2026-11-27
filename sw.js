@@ -4,7 +4,7 @@
 //   SHELL — код (html/js/іконки). Кожна версія — цілісний набір у своєму кеші.
 //   DATA  — карта, будинки, АЗС, назви місцевостей: десятки мегабайтів. Лежить окремо,
 //           щоб оновлення коду НЕ змушувало телефон качати їх знову.
-const SHELL_CACHE = 'navi-shell-v0.8.27';
+const SHELL_CACHE = 'navi-shell-v0.8.28';
 const DATA_CACHE = 'navi-data-v1';
 const KEEP = [SHELL_CACHE, DATA_CACHE];
 const SHELL = ['./', './index.html', './manifest.webmanifest', './keep.mp4',
